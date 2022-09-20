@@ -28,6 +28,12 @@ impl Internal {
         for (k, v) in manifest.as_ref().config.iter() {
             wasi = wasi.env(k, v)?;
         }
+
+        for path in manifest.as_ref().dirs.iter() {
+            let file = std::fs::File::open(path)?;
+            wasi = wasi.preopened_dir(wasmtime_wasi::Dir::from_std_file(file), path)?;
+        }
+
         Ok(Internal {
             input_length: 0,
             output_offset: 0,

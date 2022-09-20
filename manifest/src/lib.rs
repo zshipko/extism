@@ -76,6 +76,8 @@ pub struct Manifest {
     pub memory: ManifestMemory,
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    #[serde(default)]
+    pub dirs: Vec<std::path::PathBuf>,
 }
 
 mod base64 {
