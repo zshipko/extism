@@ -67,7 +67,8 @@ type Manifest struct {
 	Memory struct {
 		Max uint32 `json:"max,omitempty"`
 	} `json:"memory,omitempty"`
-	Config map[string]string `json:"config,omitempty"`
+	Config      map[string]string `json:"config,omitempty"`
+	AllowedDirs []string
 }
 
 func makePointer(data []byte) unsafe.Pointer {

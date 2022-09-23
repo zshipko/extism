@@ -29,9 +29,9 @@ impl Internal {
             wasi = wasi.env(k, v)?;
         }
 
-        for path in manifest.as_ref().dirs.iter() {
+        for (dest, path) in manifest.as_ref().allowed_dirs.iter() {
             let file = std::fs::File::open(path)?;
-            wasi = wasi.preopened_dir(wasmtime_wasi::Dir::from_std_file(file), path)?;
+            wasi = wasi.preopened_dir(wasmtime_wasi::Dir::from_std_file(file), dest)?;
         }
 
         Ok(Internal {
