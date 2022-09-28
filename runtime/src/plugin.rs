@@ -126,6 +126,8 @@ impl Plugin {
                         log_info(I64);
                         log_debug(I64);
                         log_error(I64);
+                        merge(I64, I64);
+                        extend(I64, I64);
                     });
                 }
             }

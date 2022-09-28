@@ -211,6 +211,34 @@ pub(crate) fn free(
     Ok(())
 }
 
+/// Join contiguous memory blocks
+/// Params: i64 (first offset), i64 (second offset)
+/// Returns: none
+pub(crate) fn merge(
+    mut caller: Caller<Internal>,
+    input: &[Val],
+    _output: &mut [Val],
+) -> Result<(), Trap> {
+    let data: &mut Internal = caller.data_mut();
+    let (a, b) = args!(input, (0, i64), (1, i64));
+    data.memory_mut().merge(a as usize, b as usize)?;
+    Ok(())
+}
+
+/// Extend the last allocated block
+/// Params: i64 (first offset), i64 (amount to extend by)
+/// Returns: none
+pub(crate) fn extend(
+    mut caller: Caller<Internal>,
+    input: &[Val],
+    _output: &mut [Val],
+) -> Result<(), Trap> {
+    let data: &mut Internal = caller.data_mut();
+    let (a, n) = args!(input, (0, i64), (1, i64));
+    data.memory_mut().extend(a as usize, n as usize)?;
+    Ok(())
+}
+
 /// Set the error message, this can be checked by the host program
 /// Params: i64 (offset)
 /// Returns: none

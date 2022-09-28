@@ -331,6 +331,35 @@ impl PluginMemory {
         let block_length = self.block_length(offset);
         block_length.map(|length| MemoryBlock { offset, length })
     }
+
+    /// Merge two contiguous blocks of memory
+    pub fn merge(&mut self, a: impl ToMemoryBlock, b: impl ToMemoryBlock) -> Result<(), Error> {
+        let mut a = a.to_memory_block(self)?;
+        let b = b.to_memory_block(self)?;
+
+        if b.offset != a.offset + a.length {
+            return Err(Error::msg("Blocks must be contiguous to merge"));
+        }
+
+        a.length += b.length;
+
+        self.live_blocks.insert(a.offset, a.length);
+        self.live_blocks.remove(&b.offset);
+
+        Ok(())
+    }
+
+    /// Extend the last allocated block
+    pub fn extend(&mut self, a: impl ToMemoryBlock, n: usize) -> Result<(), Error> {
+        let a = a.to_memory_block(self)?;
+
+        if self.live_blocks.keys().max() != Some(&a.offset) {
+            return Err(Error::msg("Blocks must be last allocated to extend"));
+        }
+
+        let b = self.alloc(n)?;
+        self.merge(a, b)
+    }
 }
 
 #[derive(Clone, Copy)]
