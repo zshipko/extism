@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::*;
 
 use convert::ToBytes;
@@ -59,6 +61,23 @@ pub struct Plugin {
     pub(crate) timeout: Option<Duration>,
     pub(crate) cancel: Option<(CancelHandle, futures_time::channel::Receiver<()>)>,
     pub(crate) debug_options: DebugOptions,
+    pub(crate) instantiations: usize,
+    pub(crate) require_new_instance: bool,
+    pub(crate) runtime: Option<GuestRuntime>,
+    pub(crate) allowed_paths: Option<BTreeMap<PathBuf, PathBuf>>,
+    pub(crate) allowed_hosts: Option<Vec<String>>,
+    pub(crate) functions: Vec<Function>,
+}
+
+#[derive(Clone)]
+pub(crate) enum GuestRuntime {
+    Haskell {
+        init: wasmtime::Func,
+        reactor_init: Option<wasmtime::Func>,
+    },
+    Wasi {
+        init: wasmtime::Func,
+    },
 }
 
 #[derive(Clone)]
@@ -108,6 +127,107 @@ async fn link_modules(
     Ok(())
 }
 
+async fn relink(
+    engine: wasmtime::Engine,
+    id: uuid::Uuid,
+    max_pages: Option<u32>,
+    max_http_response_bytes: Option<u64>,
+    max_var_bytes: Option<u64>,
+    with_wasi: bool,
+    allowed_paths: &Option<BTreeMap<PathBuf, PathBuf>>,
+    allowed_hosts: &Option<Vec<String>>,
+    config: BTreeMap<String, String>,
+    modules: &HashMap<String, wasmtime::Module>,
+    imports: &[Function],
+) -> Result<(wasmtime::Linker<CallContext>, wasmtime::Store<CallContext>), Error> {
+    let memory_limiter = if let Some(pgs) = max_pages {
+        let n = pgs as usize * 65536;
+        Some(call_context::MemoryLimiter {
+            max_bytes: n,
+            bytes_left: n,
+        })
+    } else {
+        None
+    };
+
+    let wasi_ctx = if with_wasi {
+        let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
+
+        if std::env::var("EXTISM_ENABLE_WASI_OUTPUT").is_ok() {
+            wasi.inherit_stdout().inherit_stderr();
+        }
+
+        if let Some(p) = allowed_paths {
+            for (k, v) in p.iter() {
+                wasi.preopened_dir(
+                    k,
+                    v.to_string_lossy(),
+                    wasmtime_wasi::DirPerms::READ | wasmtime_wasi::DirPerms::MUTATE,
+                    wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
+                )?;
+            }
+        }
+
+        Some(wasi.build_p1())
+    } else {
+        None
+    };
+
+    let mut store = wasmtime::Store::new(
+        &engine,
+        CallContext {
+            id,
+            stack: Stack::new(),
+            http_response: None,
+            http_response_status: 0,
+            config,
+            vars: HashMap::default(),
+            memory_limiter,
+            wasi_ctx,
+            max_http_response_bytes,
+            max_var_bytes,
+        },
+    );
+    let mut linked = HashSet::new();
+    let mut linker = wasmtime::Linker::new(&engine);
+
+    if with_wasi {
+        wasmtime_wasi::preview1::add_to_linker_async(&mut linker, |x: &mut CallContext| {
+            x.wasi_ctx.as_mut().unwrap()
+        })?;
+    };
+
+    pdk::add_functions(&engine, &mut linker, allowed_hosts.clone())?;
+    for f in imports.iter() {
+        let ft = wasmtime::FuncType::new(&engine, f.params.clone(), f.results.clone());
+        let f = f.clone();
+        linker.func_new_async(
+            f.module.as_str(),
+            f.name.as_str(),
+            ft,
+            move |caller, params, results| {
+                let g = unsafe {
+                    &*(f.callback.as_ref() as *const function::FunctionInner
+                        as *const function::FunctionInnerOriginal)
+                };
+                g(caller, params, results)
+            },
+        )?;
+    }
+
+    if let Some(main) = modules.get("main").cloned() {
+        link_modules(&mut store, &mut linker, "main", main, &modules, &mut linked).await?;
+    } else {
+        anyhow::bail!("no main module provided")
+    };
+
+    if max_pages.is_some() {
+        store.limiter_async(|internal| internal.memory_limiter.as_mut().unwrap());
+    }
+
+    Ok((linker, store))
+}
+
 impl Plugin {
     pub fn id(&self) -> uuid::Uuid {
         self.id
@@ -148,93 +268,22 @@ impl Plugin {
         }
         let engine = wasmtime::Engine::new(&config)?;
         let (manifest, modules) = manifest::load(&engine, wasm.into()).await?;
-
-        let memory_limiter = if let Some(pgs) = &manifest.memory.max_pages {
-            let n = *pgs as usize * 65536;
-            Some(call_context::MemoryLimiter {
-                max_bytes: n,
-                bytes_left: n,
-            })
-        } else {
-            None
-        };
-
-        let wasi_ctx = if with_wasi {
-            let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
-
-            if std::env::var("EXTISM_ENABLE_WASI_OUTPUT").is_ok() {
-                wasi.inherit_stdout().inherit_stderr();
-            }
-
-            if let Some(p) = &manifest.allowed_paths {
-                for (k, v) in p.iter() {
-                    wasi.preopened_dir(
-                        k,
-                        v.to_string_lossy(),
-                        wasmtime_wasi::DirPerms::READ | wasmtime_wasi::DirPerms::MUTATE,
-                        wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
-                    )?;
-                }
-            }
-
-            Some(wasi.build_p1())
-        } else {
-            None
-        };
-
-        let mut store = wasmtime::Store::new(
-            &engine,
-            CallContext {
-                id,
-                stack: Stack::new(),
-                http_response: None,
-                http_response_status: 0,
-                config: manifest.config,
-                vars: HashMap::default(),
-                memory_limiter,
-                wasi_ctx,
-                max_http_response_bytes: manifest.memory.max_http_response_bytes,
-                max_var_bytes: manifest.memory.max_var_bytes,
-            },
-        );
-        let mut linked = HashSet::new();
         let imports: Vec<_> = imports.into_iter().collect();
 
-        let mut linker = wasmtime::Linker::new(&engine);
-
-        if with_wasi {
-            wasmtime_wasi::preview1::add_to_linker_async(&mut linker, |x: &mut CallContext| {
-                x.wasi_ctx.as_mut().unwrap()
-            })?;
-        };
-
-        pdk::add_functions(&engine, &mut linker, manifest.allowed_hosts)?;
-        for f in imports.iter() {
-            let ft = wasmtime::FuncType::new(&engine, f.params.clone(), f.results.clone());
-            let f = f.clone();
-            linker.func_new_async(
-                f.module.as_str(),
-                f.name.as_str(),
-                ft,
-                move |caller, params, results| {
-                    let g = unsafe {
-                        &*(f.callback.as_ref() as *const function::FunctionInner
-                            as *const function::FunctionInnerOriginal)
-                    };
-                    g(caller, params, results)
-                },
-            )?;
-        }
-
-        if let Some(main) = modules.get("main").cloned() {
-            link_modules(&mut store, &mut linker, "main", main, &modules, &mut linked).await?;
-        } else {
-            anyhow::bail!("no main module provided")
-        };
-
-        if manifest.memory.max_pages.is_some() {
-            store.limiter_async(|internal| internal.memory_limiter.as_mut().unwrap());
-        }
+        let (linker, store) = relink(
+            engine,
+            id,
+            manifest.memory.max_pages,
+            manifest.memory.max_http_response_bytes,
+            manifest.memory.max_var_bytes,
+            with_wasi,
+            &manifest.allowed_paths,
+            &manifest.allowed_hosts,
+            manifest.config,
+            &modules,
+            &imports,
+        )
+        .await?;
 
         Ok(Plugin {
             id,
@@ -245,6 +294,12 @@ impl Plugin {
             timeout: manifest.timeout_ms.map(Duration::from_millis),
             cancel: None,
             debug_options,
+            instantiations: 0,
+            runtime: None,
+            require_new_instance: false,
+            allowed_paths: manifest.allowed_paths,
+            allowed_hosts: manifest.allowed_hosts,
+            functions: imports,
         })
     }
 
@@ -286,19 +341,62 @@ impl Plugin {
         self.cancel.as_ref().unwrap().0.clone()
     }
 
+    async fn reset_store(&mut self) -> Result<(), Error> {
+        let engine = self.store.engine().clone();
+        let internal = self.store.data();
+        let with_wasi = internal.wasi_ctx.is_some();
+
+        let (linker, store) = relink(
+            engine,
+            self.id,
+            internal
+                .memory_limiter
+                .as_ref()
+                .map(|x| (x.max_bytes / 65536) as u32),
+            internal.max_http_response_bytes,
+            internal.max_var_bytes,
+            with_wasi,
+            &self.allowed_paths,
+            &self.allowed_hosts,
+            internal.config.clone(),
+            &self.modules,
+            &self.functions,
+        )
+        .await?;
+        self.store = store;
+        self.linker = linker;
+        self.instantiations = 0;
+        Ok(())
+    }
+
+    pub(crate) async fn instantiate(&mut self) -> Result<(), Error> {
+        if self.instance.is_none() || self.require_new_instance {
+            if self.instantiations > 1000 {
+                self.reset_store().await?;
+            }
+
+            self.instance = Some(
+                self.linker
+                    .instantiate_async(&mut self.store, self.modules.get("main").unwrap())
+                    .await?,
+            );
+
+            self.detect_guest_runtime();
+            self.initialize_guest_runtime().await?;
+
+            self.instantiations += 1;
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn raw_call(
         &mut self,
         name: impl AsRef<str>,
         params: &[Val],
         results: &mut [Val],
     ) -> Result<(), Error> {
-        if self.instance.is_none() {
-            self.instance = Some(
-                self.linker
-                    .instantiate_async(&mut self.store, self.modules.get("main").unwrap())
-                    .await?,
-            );
-        }
+        self.instantiate().await?;
 
         // Ensure stack has a frame available
         self.store.data().stack.current();
@@ -349,6 +447,8 @@ impl Plugin {
             // No timeout or cancellation token
             f.call_async(&mut self.store, params, results).await
         };
+
+        self.require_new_instance = name.as_ref() == "_start";
 
         let res = match res {
             Ok(()) => Ok(()),
@@ -442,6 +542,101 @@ impl Plugin {
         // Get output a clear the buffer
         let out = self.take_output();
         Output::from_bytes_owned(&out)
+    }
+
+    // Do a best-effort attempt to detect any guest runtime.
+    fn detect_guest_runtime(&mut self) {
+        let instance = match &mut self.instance {
+            None => return,
+            Some(x) => x,
+        };
+        // Check for Haskell runtime initialization functions
+        // Initialize Haskell runtime if `hs_init` is present,
+        // by calling the `hs_init` export
+
+        if let Some(init) = instance.get_func(&mut self.store, "hs_init") {
+            let reactor_init = if let Some(init) = instance.get_func(&mut self.store, "_initialize")
+            {
+                if init.typed::<(), ()>(&self.store).is_err() {
+                    tracing::trace!(
+                        plugin = self.id.to_string(),
+                        "_initialize function found with type {:?}",
+                        init.ty(&self.store)
+                    );
+                    None
+                } else {
+                    tracing::trace!(plugin = self.id.to_string(), "WASI reactor module detected");
+                    Some(init)
+                }
+            } else {
+                None
+            };
+            self.runtime = Some(GuestRuntime::Haskell { init, reactor_init });
+            return;
+        }
+
+        // Check for `__wasm_call_ctors` or `_initialize`, this is used by WASI to
+        // initialize certain interfaces.
+        let init = if let Some(init) = instance.get_func(&mut self.store, "__wasm_call_ctors") {
+            if init.typed::<(), ()>(&self.store).is_err() {
+                tracing::trace!(
+                    plugin = self.id.to_string(),
+                    "__wasm_call_ctors function found with type {:?}",
+                    init.ty(&self.store)
+                );
+                return;
+            }
+            tracing::trace!(plugin = self.id.to_string(), "WASI runtime detected");
+            init
+        } else if let Some(init) = instance.get_func(&mut self.store, "_initialize") {
+            if init.typed::<(), ()>(&self.store).is_err() {
+                tracing::trace!(
+                    plugin = self.id.to_string(),
+                    "_initialize function found with type {:?}",
+                    init.ty(&self.store)
+                );
+                return;
+            }
+            tracing::trace!(plugin = self.id.to_string(), "reactor module detected");
+            init
+        } else {
+            return;
+        };
+
+        self.runtime = Some(GuestRuntime::Wasi { init });
+
+        tracing::trace!(plugin = self.id.to_string(), "no runtime detected");
+    }
+
+    // Initialize the guest runtime
+    pub(crate) async fn initialize_guest_runtime(&mut self) -> Result<(), Error> {
+        let mut store = &mut self.store;
+        if let Some(runtime) = &self.runtime {
+            tracing::trace!(plugin = self.id.to_string(), "Plugin::initialize_runtime");
+            match runtime {
+                GuestRuntime::Haskell { init, reactor_init } => {
+                    if let Some(reactor_init) = reactor_init {
+                        reactor_init.call_async(&mut store, &[], &mut []).await?;
+                    }
+                    let mut results = vec![Val::I32(0); init.ty(&store).results().len()];
+                    init.call(
+                        &mut store,
+                        &[Val::I32(0), Val::I32(0)],
+                        results.as_mut_slice(),
+                    )?;
+                    tracing::debug!(
+                        plugin = self.id.to_string(),
+                        "initialized Haskell language runtime"
+                    );
+                }
+                GuestRuntime::Wasi { init } => {
+                    init.call_async(&mut store, &[], &mut []).await?;
+                    tracing::debug!(plugin = self.id.to_string(), "initialied WASI runtime");
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
