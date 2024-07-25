@@ -1,21 +1,21 @@
-use extism_manifest::MemoryOptions;
+// use extism_manifest::MemoryOptions;
 
 use crate::*;
-use std::{io::Write, time::Instant};
+use std::time::Instant;
 
-const WASM: &[u8] = include_bytes!("../../../wasm/code-functions.wasm");
+// const WASM: &[u8] = include_bytes!("../../../wasm/code-functions.wasm");
 const WASM_NO_FUNCTIONS: &[u8] = include_bytes!("../../../wasm/code.wasm");
-const WASM_LOOP: &[u8] = include_bytes!("../../../wasm/loop.wasm");
-const WASM_GLOBALS: &[u8] = include_bytes!("../../../wasm/globals.wasm");
-const WASM_REFLECT: &[u8] = include_bytes!("../../../wasm/reflect.wasm");
-const WASM_HTTP: &[u8] = include_bytes!("../../../wasm/http.wasm");
-const WASM_FS: &[u8] = include_bytes!("../../../wasm/read_write.wasm");
+// const WASM_LOOP: &[u8] = include_bytes!("../../../wasm/loop.wasm");
+// const WASM_GLOBALS: &[u8] = include_bytes!("../../../wasm/globals.wasm");
+// const WASM_REFLECT: &[u8] = include_bytes!("../../../wasm/reflect.wasm");
+// const WASM_HTTP: &[u8] = include_bytes!("../../../wasm/http.wasm");
+// const WASM_FS: &[u8] = include_bytes!("../../../wasm/read_write.wasm");
 
 // host_fn!(pub hello_world (a: String) -> String { Ok(a) });
 
 // Which is the same as:
-fn hello_world(plugin: CurrentPlugin, inputs: &[Val], outputs: &mut [Val]) -> Result<(), Error> {
-    plugin.write_output("Hello, world!")
+fn hello_world(plugin: CurrentPlugin, _inputs: &[Val], _outputs: &mut [Val]) -> Result<(), Error> {
+    plugin.output_bytes("Hello, world!")
 }
 
 fn hello_world_panic(
@@ -33,19 +33,12 @@ pub struct Count {
 
 #[tokio::test]
 async fn it_works() {
-    let log = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter("extism=debug")
-        .with_writer(std::fs::File::create("test.log").unwrap())
-        .try_init()
-        .is_ok();
-
     let wasm_start = Instant::now();
 
     let f = Function::new_sync("extism:host/user", "hello_world", [], [], hello_world);
     let g = Function::new("test", "hello_world", [], [], hello_world_panic);
 
-    let mut plugin = Plugin::new(Manifest::new([Wasm::data(WASM)]), [f, g], true)
+    let mut plugin = Plugin::new(Manifest::new([Wasm::data(WASM_NO_FUNCTIONS)]), [f, g], true)
         .await
         .unwrap();
     println!("register loaded plugin: {:?}", wasm_start.elapsed());
@@ -53,9 +46,7 @@ async fn it_works() {
     let repeat = 1182;
     let input = "aeiouAEIOU____________________________________&smtms_y?".repeat(repeat);
     let extism_convert::Json(count) = plugin
-        .with_input(&input, true)
-        .unwrap()
-        .call::<extism_convert::Json<Count>>("count_vowels", &[], &mut [])
+        .call::<_, extism_convert::Json<Count>>("count_vowels", &input)
         .await
         .unwrap();
 
@@ -79,9 +70,7 @@ async fn it_works() {
     for _ in 0..100 {
         let test_start = Instant::now();
         plugin
-            .with_input(&input, true)
-            .unwrap()
-            .call::<Vec<u8>>("count_vowels", &[], &mut [])
+            .call::<_, Vec<u8>>("count_vowels", &input)
             .await
             .unwrap();
         test_times.push(test_start.elapsed());
@@ -132,12 +121,6 @@ async fn it_works() {
     let avg: std::time::Duration = sum / num_tests as u32;
 
     println!("wasm function call (avg, N = {}): {:?}", num_tests, avg);
-
-    // Check that log file was written to
-    if log {
-        let meta = std::fs::metadata("test.log").unwrap();
-        assert!(meta.len() > 0);
-    }
 }
 
 /*
@@ -670,16 +653,16 @@ fn test_no_vars() {
     assert!(output.is_err());
     let output: Result<(), Error> = plugin.call("test", vec![]);
     assert!(output.is_ok());
-}
+}*/
 
 #[tokio::test]
-fn test_linking() {
+async fn test_linking() -> Result<(), Error> {
     let manifest = Manifest::new([
         Wasm::Data {
             data: br#"
                 (module
                     (import "wasi_snapshot_preview1" "random_get" (func $random (param i32 i32) (result i32)))
-                    (import "extism:host/env" "alloc" (func $alloc (param i64) (result i64)))
+                    (import "extism:host/env" "read" (func $read (param i32 i64) (result i64)))
                     (import "extism:host/user" "hello" (func $hello))
                     (global $counter (mut i32) (i32.const 0))
                     (func $start (export "_start")
@@ -701,22 +684,16 @@ fn test_linking() {
                 (module
                     (import "commander" "_start" (func $commander_start))
                     (import "commander" "read_counter" (func $commander_read_counter (result i32)))
-                    (import "extism:host/env" "store_u64" (func $store_u64 (param i64 i64)))
-                    (import "extism:host/env" "alloc" (func $alloc (param i64) (result i64)))
+                    (import "extism:host/env" "write" (func $write (param i32 i64) (result i64)))
                     (import "extism:host/user" "hello" (func $hello))
-                    (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
-                    (func (export "run") (result i32)
-                        (local $output i64)
-                        (local.set $output (call $alloc (i64.const 8)))
-
+                    (import "extism:host/env" "read" (func $read (param i32 i64) (result i64)))
+                    (func (export "run") (result i64)
                         (call $commander_start)
                         (call $commander_start)
                         (call $commander_start)
                         (call $commander_start)
                         (call $hello)
-                        (call $store_u64 (local.get $output) (i64.extend_i32_u (call $commander_read_counter)))
-                        (call $output_set (local.get $output) (i64.const 8))
-                        i32.const 0
+                        (i64.extend_i32_u (call $commander_read_counter))
                     )
                 )
             "#.to_vec(),
@@ -728,17 +705,26 @@ fn test_linking() {
     ]);
     let mut plugin = PluginBuilder::new(manifest)
         .with_wasi(true)
-        .with_function("hello", [], [], UserData::new(()), |_, _, _, _| {
+        .with_function_sync("extism:host/user", "hello", [], [], |_, _, _| {
             eprintln!("hello!");
             Ok(())
         })
         .build()
+        .await
         .unwrap();
 
     for _ in 0..5 {
-        assert_eq!(plugin.call::<&str, i64>("run", "Hello, world!").unwrap(), 1);
+        let res = CallBuilder::new(&mut plugin)
+            .result(ValType::I32)
+            .input("Hello, world!")?
+            .call_with_results::<()>("run")
+            .await?;
+        assert_eq!(res.results()[0].unwrap_i64(), 1);
     }
+
+    Ok(())
 }
+/*
 
 #[test]
 fn test_readonly_dirs() {

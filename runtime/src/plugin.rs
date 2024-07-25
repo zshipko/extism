@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::*;
 
-use convert::ToBytes;
+use convert::{FromBytes, ToBytes};
 use futures::StreamExt;
 use futures_time::{prelude::*, time::Duration};
 
@@ -58,29 +58,30 @@ impl CancelHandle {
     }
 }
 
-async fn link_modules(
-    mut store: &mut wasmtime::Store<CallContext>,
-    linker: &mut wasmtime::Linker<CallContext>,
-    name: &str,
+fn link_modules<'a>(
+    mut store: &'a mut wasmtime::Store<CallContext>,
+    linker: &'a mut wasmtime::Linker<CallContext>,
+    name: &'a str,
     module: wasmtime::Module,
-    modules: &HashMap<String, wasmtime::Module>,
-    linked: &mut HashSet<String>,
-) -> Result<(), Error> {
-    for import in module.imports() {
-        let mname = import.module();
+    modules: &'a HashMap<String, wasmtime::Module>,
+    linked: &'a mut HashSet<String>,
+) -> std::pin::Pin<Box<dyn 'a + std::future::Future<Output = Result<(), Error>>>> {
+    Box::pin(async move {
+        for import in module.imports() {
+            let mname = import.module();
 
-        if !linked.contains(mname) {
-            if let Some(m) = modules.get(mname).cloned() {
-                linker.module_async(&mut store, name, &m).await?;
-                linked.insert(mname.to_string());
+            if !linked.contains(mname) {
+                if let Some(m) = modules.get(mname).cloned() {
+                    link_modules(&mut store, linker, mname, m, modules, linked).await?;
+                }
             }
         }
-    }
 
-    linker.module_async(store, name, &module).await?;
-    linked.insert(name.to_string());
+        linker.module_async(store, name, &module).await?;
+        linked.insert(name.to_string());
 
-    Ok(())
+        Ok(())
+    })
 }
 
 async fn relink(
@@ -723,5 +724,39 @@ impl<'a> CallBuilder<'a> {
         self.plugin
             .call_with_args(name, &self.params, &mut self.results)
             .await
+    }
+
+    pub async fn call_with_results<'b, T: 'b + FromBytes<'b>>(
+        mut self,
+        name: impl AsRef<str>,
+    ) -> Result<CallResults<'b, T>, Error> {
+        self.plugin
+            .raw_call(name, &self.params, &mut self.results)
+            .await?;
+        Ok(CallResults {
+            output: self.plugin.take_output(),
+            results: self.results,
+            _t: Default::default(),
+        })
+    }
+}
+
+pub struct CallResults<'a, T: FromBytes<'a>> {
+    output: Vec<u8>,
+    results: Vec<Val>,
+    _t: std::marker::PhantomData<&'a T>,
+}
+
+impl<'a, T: FromBytes<'a>> CallResults<'a, T> {
+    pub fn results(&self) -> &[Val] {
+        &self.results
+    }
+
+    pub fn output_bytes(&self) -> &[u8] {
+        &self.output
+    }
+
+    pub fn output(&'a self) -> Result<T, Error> {
+        T::from_bytes(&self.output)
     }
 }

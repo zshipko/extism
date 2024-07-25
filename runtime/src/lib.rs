@@ -21,7 +21,7 @@ pub use current_plugin::CurrentPlugin;
 pub use function::{Function, FunctionResult};
 pub use manifest::WasmInput;
 pub use pipe::{Frame, Pipe, Stack};
-pub use plugin::{CallBuilder, CancelHandle, Plugin};
+pub use plugin::{CallBuilder, CallResults, CancelHandle, Plugin};
 pub use plugin_builder::{DebugOptions, PluginBuilder};
 
 pub use anyhow::Error;
@@ -32,6 +32,9 @@ pub use wasmtime::{Val, ValType};
 pub mod val {
     pub use wasmtime::{ExternRef, HeapType, RefType};
 }
+
+#[cfg(test)]
+mod tests;
 
 pub const HANDLE: ValType = ValType::I64;
 

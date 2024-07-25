@@ -1,5 +1,7 @@
 use extism::*;
-fn main() {
+
+#[tokio::main]
+async fn main() {
     let url = Wasm::file("../wasm/read_write.wasm");
     let manifest = Manifest::new([url])
         .with_allowed_path("ro:src/tests/data".to_string(), "/data")
@@ -8,11 +10,12 @@ fn main() {
     let mut plugin = PluginBuilder::new(manifest)
         .with_wasi(true)
         .build()
+        .await
         .unwrap();
 
     println!("trying to read file: ");
 
-    let res = plugin.call::<&str, &str>("try_read", "").unwrap();
+    let res = plugin.call::<&str, String>("try_read", "").await.unwrap();
 
     println!("{:?}", res);
 
@@ -25,7 +28,10 @@ fn main() {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
     );
-    let res2 = plugin.call::<&str, &str>("try_write", &line).unwrap();
+    let res2 = plugin
+        .call::<&str, String>("try_write", &line)
+        .await
+        .unwrap();
 
     println!("{:?}", res2);
 
