@@ -1,11 +1,65 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
-use std::io::Read;
+
+use tracing::trace;
 
 use sha2::Digest;
 
-use crate::plugin::{WasmInput, MAIN_KEY};
 use crate::*;
+
+/// Defines an input type for Wasm data.
+///
+/// Types that implement `Into<WasmInput>` can be passed directly into `Plugin::new`
+pub enum WasmInput<'a> {
+    /// Raw Wasm module
+    Data(std::borrow::Cow<'a, [u8]>),
+    /// Owned manifest
+    Manifest(Manifest),
+    /// Borrowed manifest
+    ManifestRef(&'a Manifest),
+}
+
+impl<'a> From<Manifest> for WasmInput<'a> {
+    fn from(value: Manifest) -> Self {
+        WasmInput::Manifest(value)
+    }
+}
+
+impl<'a> From<&'a Manifest> for WasmInput<'a> {
+    fn from(value: &'a Manifest) -> Self {
+        WasmInput::ManifestRef(value)
+    }
+}
+
+impl<'a> From<&'a mut Manifest> for WasmInput<'a> {
+    fn from(value: &'a mut Manifest) -> Self {
+        WasmInput::ManifestRef(value)
+    }
+}
+
+impl<'a> From<&'a [u8]> for WasmInput<'a> {
+    fn from(value: &'a [u8]) -> Self {
+        WasmInput::Data(value.into())
+    }
+}
+
+impl<'a> From<&'a str> for WasmInput<'a> {
+    fn from(value: &'a str) -> Self {
+        WasmInput::Data(value.as_bytes().into())
+    }
+}
+
+impl<'a> From<Vec<u8>> for WasmInput<'a> {
+    fn from(value: Vec<u8>) -> Self {
+        WasmInput::Data(value.into())
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for WasmInput<'a> {
+    fn from(value: &'a Vec<u8>) -> Self {
+        WasmInput::Data(value.into())
+    }
+}
 
 fn hex(data: &[u8]) -> String {
     let mut s = String::new();
@@ -33,21 +87,21 @@ fn check_hash(hash: &Option<String>, data: &[u8]) -> Result<Option<String>, Erro
     }
 }
 
-const WASM: &[u8] = include_bytes!("extism-runtime.wasm");
-
 /// Convert from manifest to a wasmtime Module
-fn to_module(engine: &Engine, wasm: &extism_manifest::Wasm) -> Result<(String, Module), Error> {
+async fn to_module(
+    engine: &wasmtime::Engine,
+    wasm: &extism_manifest::Wasm,
+) -> Result<(String, wasmtime::Module), Error> {
     match wasm {
         extism_manifest::Wasm::File { path, meta } => {
             if cfg!(not(feature = "register-filesystem")) {
                 return Err(anyhow::format_err!("File-based registration is disabled"));
             }
 
-            // Use the configured name or `MAIN_KEY`
-            let name = meta.name.as_deref().unwrap_or(MAIN_KEY).to_string();
+            let name = meta.name.as_deref().unwrap_or("main").to_string();
 
             // Load file
-            let buf = std::fs::read(path).map_err(|err| {
+            let buf = tokio::fs::read(path).await.map_err(|err| {
                 Error::msg(format!(
                     "Unable to load Wasm file \"{}\": {}",
                     path.display(),
@@ -56,16 +110,15 @@ fn to_module(engine: &Engine, wasm: &extism_manifest::Wasm) -> Result<(String, M
             })?;
 
             check_hash(&meta.hash, &buf)?;
-            Ok((name, Module::new(engine, buf)?))
+            Ok((name, wasmtime::Module::new(engine, buf)?))
         }
         extism_manifest::Wasm::Data { meta, data } => {
             check_hash(&meta.hash, data)?;
             Ok((
-                meta.name.as_deref().unwrap_or(MAIN_KEY).to_string(),
-                Module::new(engine, data)?,
+                meta.name.as_deref().unwrap_or("main").to_string(),
+                wasmtime::Module::new(engine, data)?,
             ))
         }
-        #[allow(unused)]
         extism_manifest::Wasm::Url {
             req:
                 extism_manifest::HttpRequest {
@@ -86,22 +139,22 @@ fn to_module(engine: &Engine, wasm: &extism_manifest::Wasm) -> Result<(String, M
             #[cfg(feature = "register-http")]
             {
                 // Setup request
-                let mut req = ureq::request(method.as_deref().unwrap_or("GET"), url);
+                let mut req = reqwest::Client::new()
+                    .request(method.as_deref().unwrap_or("GET").parse()?, url);
 
                 for (k, v) in headers.iter() {
-                    req = req.set(k, v);
+                    req = req.header(k, v);
                 }
 
                 // Fetch WASM code
-                let mut r = req.call()?.into_reader();
-                let mut data = Vec::new();
-                r.read_to_end(&mut data)?;
+                let r = req.send().await?.bytes().await?;
+                let data = r.to_vec();
 
                 // Check hash against manifest
                 check_hash(&meta.hash, &data)?;
 
                 // Convert fetched data to module
-                let module = Module::new(engine, data)?;
+                let module = wasmtime::Module::new(engine, data)?;
 
                 Ok((name.to_string(), module))
             }
@@ -111,12 +164,11 @@ fn to_module(engine: &Engine, wasm: &extism_manifest::Wasm) -> Result<(String, M
 
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
 
-pub(crate) fn load(
-    engine: &Engine,
+pub(crate) async fn load(
+    engine: &wasmtime::Engine,
     input: WasmInput<'_>,
-) -> Result<(extism_manifest::Manifest, BTreeMap<String, Module>), Error> {
-    let mut mods = BTreeMap::new();
-    mods.insert(EXTISM_ENV_MODULE.to_string(), Module::new(engine, WASM)?);
+) -> Result<(extism_manifest::Manifest, HashMap<String, wasmtime::Module>), Error> {
+    let mut mods = HashMap::new();
 
     match input {
         WasmInput::Data(data) => {
@@ -129,45 +181,43 @@ pub(crate) fn load(
                     && s[1..].trim_start().starts_with("module"); // Then `module` (after any whitespace)
                 starts_with_module || s.starts_with(";;") || s.starts_with("(;")
             });
+
             if !has_magic && !is_wat {
                 trace!("Loading manifest");
                 if let Ok(s) = s {
-                    let t = if let Ok(t) = toml::from_str::<extism_manifest::Manifest>(s) {
-                        trace!("Manifest is TOML");
-                        modules(engine, &t, &mut mods)?;
-                        t
-                    } else if let Ok(t) = serde_json::from_str::<extism_manifest::Manifest>(s) {
+                    if let Ok(t) = serde_json::from_str::<extism_manifest::Manifest>(s) {
                         trace!("Manifest is JSON");
-                        modules(engine, &t, &mut mods)?;
-                        t
+                        modules(engine, &t, &mut mods).await?;
+                        return Ok((t, mods));
                     } else {
                         anyhow::bail!("Unknown manifest format");
                     };
-                    return Ok((t, mods));
                 }
             }
 
-            let m = Module::new(engine, data)?;
+            let m = wasmtime::Module::new(engine, data)?;
             mods.insert(MAIN_KEY.to_string(), m);
             Ok((Default::default(), mods))
         }
         WasmInput::Manifest(m) => {
             trace!("Loading from existing manifest");
-            modules(engine, &m, &mut mods)?;
+            modules(engine, &m, &mut mods).await?;
             Ok((m, mods))
         }
         WasmInput::ManifestRef(m) => {
             trace!("Loading from existing manifest");
-            modules(engine, m, &mut mods)?;
+            modules(engine, m, &mut mods).await?;
             Ok((m.clone(), mods))
         }
     }
 }
 
-pub(crate) fn modules(
-    engine: &Engine,
+const MAIN_KEY: &'static str = "main";
+
+pub(crate) async fn modules(
+    engine: &wasmtime::Engine,
     manifest: &extism_manifest::Manifest,
-    modules: &mut BTreeMap<String, Module>,
+    modules: &mut HashMap<String, wasmtime::Module>,
 ) -> Result<(), Error> {
     if manifest.wasm.is_empty() {
         return Err(anyhow::format_err!(
@@ -177,13 +227,13 @@ pub(crate) fn modules(
 
     // If there's only one module, it should be called `main`
     if manifest.wasm.len() == 1 {
-        let (_, m) = to_module(engine, &manifest.wasm[0])?;
+        let (_, m) = to_module(engine, &manifest.wasm[0]).await?;
         modules.insert(MAIN_KEY.to_string(), m);
         return Ok(());
     }
 
     for (i, f) in manifest.wasm.iter().enumerate() {
-        let (mut name, m) = to_module(engine, f)?;
+        let (mut name, m) = to_module(engine, f).await?;
         // Rename the last module to `main` if no main is defined already
         if i == manifest.wasm.len() - 1 && !modules.contains_key(MAIN_KEY) {
             name = MAIN_KEY.to_string();

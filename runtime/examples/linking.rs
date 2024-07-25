@@ -1,6 +1,7 @@
 use extism::*;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let manifest = Manifest::new([
         // upper.wat provides an export called `host_reflect` that takes a string
         // and returns the same string uppercased
@@ -24,11 +25,12 @@ fn main() {
             },
         },
     ]);
-    let mut plugin = PluginBuilder::new(manifest).build().unwrap();
+    let mut plugin = PluginBuilder::new(manifest).build().await.unwrap();
 
     for _ in 0..5 {
         let res = plugin
-            .call::<&str, &str>("reflect", "Hello, world!")
+            .call::<&str, String>("reflect", "Hello, world!")
+            .await
             .unwrap();
         println!("{}", res);
     }

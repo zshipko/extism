@@ -1,306 +1,127 @@
-use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
-
 use crate::*;
 
-pub const EXTISM_ENV_MODULE: &str = "extism:host/env";
-pub const EXTISM_USER_MODULE: &str = "extism:host/user";
-pub(crate) const MAIN_KEY: &str = "main";
+use convert::ToBytes;
+use futures::StreamExt;
+use futures_time::{prelude::*, time::Duration};
 
-#[derive(Default, Clone)]
-pub(crate) struct Output {
-    pub(crate) offset: u64,
-    pub(crate) length: u64,
-    pub(crate) error_offset: u64,
-    pub(crate) error_length: u64,
+use self::plugin_builder::CacheConfig;
+
+#[repr(transparent)]
+pub struct CurrentPlugin<'a>(pub(crate) wasmtime::Caller<'a, CallContext>);
+
+impl<'a> CurrentPlugin<'a> {
+    pub fn input(&self) -> Pipe {
+        self.0.data().stack.current().input()
+    }
+
+    pub fn output(&self) -> Pipe {
+        self.0.data().stack.current().output()
+    }
+
+    pub fn input_bytes(&self) -> Vec<u8> {
+        self.0.data().stack.current().input().take()
+    }
+
+    pub fn output_bytes(&self, data: impl AsRef<[u8]>) -> Result<(), Error> {
+        self.0
+            .data()
+            .stack
+            .current()
+            .output()
+            .write_all(data.as_ref())?;
+        Ok(())
+    }
+
+    pub fn handle_data(&mut self, h: u64) -> Result<&mut [u8], Error> {
+        let (offs, len) = pdk::handle(h);
+        let offs = offs as usize;
+        let len = len as usize;
+        let data = self
+            .0
+            .get_export("memory")
+            .unwrap()
+            .into_memory()
+            .unwrap()
+            .data_mut(&mut self.0);
+        if offs > data.len() || offs + len > data.len() {
+            anyhow::bail!("Invalid memory handle: offs={}, len={}", offs, len);
+        }
+        Ok(&mut data[offs..offs + len])
+    }
 }
 
-/// A `CancelHandle` can be used to cancel a running plugin from another thread
+pub struct Plugin {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) store: wasmtime::Store<CallContext>,
+    pub(crate) linker: wasmtime::Linker<CallContext>,
+    pub(crate) instance: Option<wasmtime::Instance>,
+    pub(crate) modules: HashMap<String, wasmtime::Module>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) cancel: Option<(CancelHandle, futures_time::channel::Receiver<()>)>,
+    pub(crate) debug_options: DebugOptions,
+}
+
 #[derive(Clone)]
-pub struct CancelHandle {
-    pub(crate) timer_tx: std::sync::mpsc::Sender<TimerAction>,
-    pub id: uuid::Uuid,
-}
+pub struct CancelHandle(futures_time::channel::Sender<()>, uuid::Uuid);
 
-unsafe impl Sync for CancelHandle {}
 unsafe impl Send for CancelHandle {}
+unsafe impl Sync for CancelHandle {}
 
 impl CancelHandle {
-    pub fn cancel(&self) -> Result<(), Error> {
-        debug!(plugin = self.id.to_string(), "sending cancel event");
-        self.timer_tx.send(TimerAction::Cancel { id: self.id })?;
+    pub fn id(&self) -> uuid::Uuid {
+        self.1
+    }
+
+    pub async fn cancel(&self) -> Result<(), Error> {
+        self.0.send(()).await?;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_blocking(&self) -> Result<(), Error> {
+        self.0.send_blocking(())?;
         Ok(())
     }
 }
 
-/// Plugin contains everything needed to execute a WASM function
-pub struct Plugin {
-    /// A unique ID for each plugin
-    pub id: uuid::Uuid,
-
-    /// Wasmtime linker
-    pub(crate) linker: Linker<CurrentPlugin>,
-
-    /// Wasmtime store
-    pub(crate) store: Store<CurrentPlugin>,
-
-    /// A handle used to cancel execution of a plugin
-    pub(crate) cancel_handle: CancelHandle,
-
-    /// All modules that were provided to the linker
-    pub(crate) modules: BTreeMap<String, Module>,
-
-    /// Instance provides the ability to call functions in a module, a `Plugin` is initialized with
-    /// an `instance_pre` but no `instance`. The `instance` will be created during `Plugin::raw_call`
-    pub(crate) instance: std::sync::Arc<std::sync::Mutex<Option<Instance>>>,
-    pub(crate) instance_pre: InstancePre<CurrentPlugin>,
-
-    /// Keep track of the number of times we're instantiated, this exists
-    /// to avoid issues with memory piling up since `Instance`s are only
-    /// actually cleaned up along with a `Store`
-    instantiations: usize,
-
-    /// Runtime determines any initialization functions needed
-    /// to run a module
-    pub(crate) runtime: Option<GuestRuntime>,
-
-    /// Keep a reference to the host functions
-    _functions: Vec<Function>,
-
-    /// Communication with the timer thread
-    pub(crate) timer_tx: std::sync::mpsc::Sender<TimerAction>,
-
-    /// Information that gets populated after a call
-    pub(crate) output: Output,
-
-    /// Set to `true` when de-initializarion may have occured (i.e.a call to `_start`),
-    /// in this case we need to re-initialize the entire module.
-    pub(crate) store_needs_reset: bool,
-
-    pub(crate) debug_options: DebugOptions,
-
-    pub(crate) error_msg: Option<Vec<u8>>,
-}
-
-unsafe impl Send for Plugin {}
-unsafe impl Sync for Plugin {}
-
-impl std::fmt::Debug for Plugin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Plugin({})", self.id)
-    }
-}
-
-impl Internal for Plugin {
-    fn store(&self) -> &Store<CurrentPlugin> {
-        &self.store
-    }
-
-    fn store_mut(&mut self) -> &mut Store<CurrentPlugin> {
-        &mut self.store
-    }
-
-    fn linker_and_store(&mut self) -> (&mut Linker<CurrentPlugin>, &mut Store<CurrentPlugin>) {
-        (&mut self.linker, &mut self.store)
-    }
-}
-
-pub(crate) fn profiling_strategy() -> ProfilingStrategy {
-    match std::env::var("EXTISM_PROFILE").as_deref() {
-        Ok("perf") => ProfilingStrategy::PerfMap,
-        Ok("jitdump") => ProfilingStrategy::JitDump,
-        Ok("vtune") => ProfilingStrategy::VTune,
-        Ok(x) => {
-            warn!("Invalid value for EXTISM_PROFILE: {x}");
-            ProfilingStrategy::None
-        }
-        Err(_) => ProfilingStrategy::None,
-    }
-}
-
-/// Defines an input type for Wasm data.
-///
-/// Types that implement `Into<WasmInput>` can be passed directly into `Plugin::new`
-pub enum WasmInput<'a> {
-    /// Raw Wasm module
-    Data(std::borrow::Cow<'a, [u8]>),
-    /// Owned manifest
-    Manifest(Manifest),
-    /// Borrowed manifest
-    ManifestRef(&'a Manifest),
-}
-
-impl<'a> From<Manifest> for WasmInput<'a> {
-    fn from(value: Manifest) -> Self {
-        WasmInput::Manifest(value)
-    }
-}
-
-impl<'a> From<&'a Manifest> for WasmInput<'a> {
-    fn from(value: &'a Manifest) -> Self {
-        WasmInput::ManifestRef(value)
-    }
-}
-
-impl<'a> From<&'a mut Manifest> for WasmInput<'a> {
-    fn from(value: &'a mut Manifest) -> Self {
-        WasmInput::ManifestRef(value)
-    }
-}
-
-impl<'a> From<&'a [u8]> for WasmInput<'a> {
-    fn from(value: &'a [u8]) -> Self {
-        WasmInput::Data(value.into())
-    }
-}
-
-impl<'a> From<&'a str> for WasmInput<'a> {
-    fn from(value: &'a str) -> Self {
-        WasmInput::Data(value.as_bytes().into())
-    }
-}
-
-impl<'a> From<Vec<u8>> for WasmInput<'a> {
-    fn from(value: Vec<u8>) -> Self {
-        WasmInput::Data(value.into())
-    }
-}
-
-impl<'a> From<&'a Vec<u8>> for WasmInput<'a> {
-    fn from(value: &'a Vec<u8>) -> Self {
-        WasmInput::Data(value.into())
-    }
-}
-
-fn add_module<T: 'static>(
-    store: &mut Store<T>,
-    linker: &mut Linker<T>,
-    linked: &mut BTreeSet<String>,
-    modules: &BTreeMap<String, Module>,
-    name: String,
-    module: &Module,
+async fn link_modules(
+    mut store: &mut wasmtime::Store<CallContext>,
+    linker: &mut wasmtime::Linker<CallContext>,
+    name: &str,
+    module: wasmtime::Module,
+    modules: &HashMap<String, wasmtime::Module>,
+    linked: &mut HashSet<String>,
 ) -> Result<(), Error> {
-    if linked.contains(&name) {
-        return Ok(());
-    }
-
     for import in module.imports() {
-        let module = import.module();
+        let mname = import.module();
 
-        if module == EXTISM_ENV_MODULE && !matches!(import.ty(), ExternType::Func(_)) {
-            anyhow::bail!("linked modules cannot access non-function exports of extism kernel");
-        }
-
-        if !linked.contains(import.module()) {
-            if let Some(m) = modules.get(import.module()) {
-                add_module(
-                    store,
-                    linker,
-                    linked,
-                    modules,
-                    import.module().to_string(),
-                    m,
-                )?;
+        if !linked.contains(mname) {
+            if let Some(m) = modules.get(mname).cloned() {
+                linker.module_async(&mut store, name, &m).await?;
+                linked.insert(mname.to_string());
             }
         }
     }
 
-    linker.module(store, name.as_str(), module)?;
-    linked.insert(name);
+    linker.module_async(store, name, &module).await?;
+    linked.insert(name.to_string());
 
     Ok(())
 }
 
-fn relink(
-    engine: &Engine,
-    mut store: &mut Store<CurrentPlugin>,
-    imports: &[Function],
-    modules: &BTreeMap<String, Module>,
-    with_wasi: bool,
-) -> Result<(InstancePre<CurrentPlugin>, Linker<CurrentPlugin>), Error> {
-    let mut linker = Linker::new(engine);
-    // Define PDK functions
-    macro_rules! add_funcs {
-            ($($name:ident($($args:expr),*) $(-> $($r:expr),*)?);* $(;)?) => {
-                $(
-                    let t = FuncType::new(&engine, [$($args),*], [$($($r),*)?]);
-                    linker.func_new(EXTISM_ENV_MODULE, stringify!($name), t, pdk::$name)?;
-                )*
-            };
-        }
-
-    // Add builtins
-    use wasmtime::ValType::*;
-    add_funcs!(
-        config_get(I64) -> I64;
-        var_get(I64) -> I64;
-        var_set(I64, I64);
-        http_request(I64, I64) -> I64;
-        http_status_code() -> I32;
-        log_warn(I64);
-        log_info(I64);
-        log_debug(I64);
-        log_error(I64);
-    );
-
-    let mut linked = BTreeSet::new();
-    linker.module(&mut store, EXTISM_ENV_MODULE, &modules[EXTISM_ENV_MODULE])?;
-    linked.insert(EXTISM_ENV_MODULE.to_string());
-
-    // If wasi is enabled then add it to the linker
-    if with_wasi {
-        wasi_common::sync::add_to_linker(&mut linker, |x: &mut CurrentPlugin| {
-            &mut x.wasi.as_mut().unwrap().ctx
-        })?;
-    }
-
-    for f in imports {
-        let name = f.name();
-        let ns = f.namespace().unwrap_or(EXTISM_USER_MODULE);
-        unsafe {
-            linker.func_new(ns, name, f.ty(engine).clone(), &*(f.f.as_ref() as *const _))?;
-        }
-    }
-
-    for (name, module) in modules.iter() {
-        add_module(
-            store,
-            &mut linker,
-            &mut linked,
-            modules,
-            name.clone(),
-            module,
-        )?;
-    }
-
-    let main = &modules[MAIN_KEY];
-    let instance_pre = linker.instantiate_pre(main)?;
-    Ok((instance_pre, linker))
-}
-
 impl Plugin {
-    /// Create a new plugin from a Manifest or WebAssembly module, and host functions. The `with_wasi`
-    /// parameter determines whether or not the module should be executed with WASI enabled.
-    pub fn new<'a>(
+    pub fn id(&self) -> uuid::Uuid {
+        self.id
+    }
+
+    pub(crate) async fn new_ex<'a>(
         wasm: impl Into<WasmInput<'a>>,
         imports: impl IntoIterator<Item = Function>,
         with_wasi: bool,
-    ) -> Result<Plugin, Error> {
-        Self::build_new(wasm.into(), imports, with_wasi, Default::default(), None)
-    }
-
-    pub(crate) fn build_new(
-        wasm: WasmInput<'_>,
-        imports: impl IntoIterator<Item = Function>,
-        with_wasi: bool,
         debug_options: DebugOptions,
-        cache_dir: Option<Option<PathBuf>>,
-    ) -> Result<Plugin, Error> {
-        // Setup wasmtime types
-        let mut config = Config::new();
+        cache_config: CacheConfig,
+    ) -> Result<Self, Error> {
+        let id = uuid::Uuid::new_v4();
+        let mut config = wasmtime::Config::new();
         config
             .epoch_interruption(true)
             .debug_info(debug_options.debug_info)
@@ -310,12 +131,12 @@ impl Plugin {
             .wasm_function_references(true)
             .wasm_gc(true);
 
-        match cache_dir {
-            Some(None) => (),
-            Some(Some(path)) => {
+        match cache_config {
+            CacheConfig::Disable => (),
+            CacheConfig::Path(path) => {
                 config.cache_config_load(path)?;
             }
-            None => {
+            CacheConfig::Default => {
                 if let Ok(env) = std::env::var("EXTISM_CACHE_CONFIG") {
                     if !env.is_empty() {
                         config.cache_config_load(&env)?;
@@ -325,738 +146,301 @@ impl Plugin {
                 }
             }
         }
+        let engine = wasmtime::Engine::new(&config)?;
+        let (manifest, modules) = manifest::load(&engine, wasm.into()).await?;
 
-        let engine = Engine::new(&config)?;
-        let (manifest, modules) = manifest::load(&engine, wasm)?;
-        if modules.len() <= 1 {
-            anyhow::bail!("No wasm modules provided");
-        } else if !modules.contains_key(MAIN_KEY) {
-            anyhow::bail!("No main module provided");
-        }
-
-        let available_pages = manifest.memory.max_pages;
-        debug!("Available pages: {available_pages:?}");
-
-        let id = uuid::Uuid::new_v4();
-        let mut store = Store::new(
-            &engine,
-            CurrentPlugin::new(manifest, with_wasi, available_pages, id)?,
-        );
-        store.set_epoch_deadline(1);
-
-        let imports: Vec<Function> = imports.into_iter().collect();
-        let (instance_pre, linker) = relink(&engine, &mut store, &imports, &modules, with_wasi)?;
-
-        let timer_tx = Timer::tx();
-        let mut plugin = Plugin {
-            modules,
-            linker,
-            instance: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            instance_pre,
-            store,
-            runtime: None,
-            id,
-            timer_tx: timer_tx.clone(),
-            cancel_handle: CancelHandle { id, timer_tx },
-            instantiations: 0,
-            output: Output::default(),
-            store_needs_reset: false,
-            debug_options,
-            _functions: imports,
-            error_msg: None,
-        };
-
-        plugin.current_plugin_mut().store = &mut plugin.store;
-        plugin.current_plugin_mut().linker = &mut plugin.linker;
-        if available_pages.is_some() {
-            plugin
-                .store
-                .limiter(|internal| internal.memory_limiter.as_mut().unwrap());
-        }
-        debug!("{} created", plugin.id);
-        Ok(plugin)
-    }
-
-    // Resets the store and linker to avoid running into Wasmtime memory limits
-    pub(crate) fn reset_store(
-        &mut self,
-        instance_lock: &mut std::sync::MutexGuard<Option<Instance>>,
-    ) -> Result<(), Error> {
-        if self.store_needs_reset {
-            let engine = self.store.engine().clone();
-            let internal = self.current_plugin_mut();
-            let with_wasi = internal.wasi.is_some();
-            self.store = Store::new(
-                &engine,
-                CurrentPlugin::new(
-                    internal.manifest.clone(),
-                    internal.wasi.is_some(),
-                    internal.available_pages,
-                    self.id,
-                )?,
-            );
-            self.store.set_epoch_deadline(1);
-
-            let (instance_pre, linker) = relink(
-                &engine,
-                &mut self.store,
-                &self._functions,
-                &self.modules,
-                with_wasi,
-            )?;
-            self.linker = linker;
-            self.instance_pre = instance_pre;
-            let store = &mut self.store as *mut _;
-            let linker = &mut self.linker as *mut _;
-            let current_plugin = self.current_plugin_mut();
-            current_plugin.store = store;
-            current_plugin.linker = linker;
-            if current_plugin.available_pages.is_some() {
-                self.store
-                    .limiter(|internal| internal.memory_limiter.as_mut().unwrap());
-            }
-
-            self.instantiations = 0;
-            **instance_lock = None;
-            self.store_needs_reset = false;
-        }
-        Ok(())
-    }
-
-    // Instantiate the module. This is done lazily to avoid running any code outside of the `call` function,
-    // since wasmtime may execute a start function (if configured) at instantiation time,
-    pub(crate) fn instantiate(
-        &mut self,
-        instance_lock: &mut std::sync::MutexGuard<Option<Instance>>,
-    ) -> Result<(), Error> {
-        if instance_lock.is_some() {
-            return Ok(());
-        }
-
-        let instance = self.instance_pre.instantiate(&mut self.store)?;
-        trace!(
-            plugin = self.id.to_string(),
-            "Plugin::instance is none, instantiating"
-        );
-        **instance_lock = Some(instance);
-        self.instantiations += 1;
-        if let Some(limiter) = &mut self.current_plugin_mut().memory_limiter {
-            limiter.reset();
-        }
-        self.detect_guest_runtime(instance_lock);
-        self.initialize_guest_runtime()?;
-        Ok(())
-    }
-
-    /// Get an exported function by name
-    pub(crate) fn get_func(
-        &mut self,
-        instance_lock: &mut std::sync::MutexGuard<Option<Instance>>,
-        function: impl AsRef<str>,
-    ) -> Option<Func> {
-        if let Some(instance) = &mut **instance_lock {
-            instance.get_func(&mut self.store, function.as_ref())
+        let memory_limiter = if let Some(pgs) = &manifest.memory.max_pages {
+            let n = *pgs as usize * 65536;
+            Some(call_context::MemoryLimiter {
+                max_bytes: n,
+                bytes_left: n,
+            })
         } else {
             None
-        }
-    }
+        };
 
-    /// Returns `true` if the given function exists, otherwise `false`
-    pub fn function_exists(&mut self, function: impl AsRef<str>) -> bool {
-        self.modules[MAIN_KEY]
-            .get_export(function.as_ref())
-            .map(|x| {
-                if let Some(f) = x.func() {
-                    let (params, mut results) = (f.params(), f.results());
-                    match (params.len(), results.len()) {
-                        (0, 1) => matches!(results.next(), Some(wasmtime::ValType::I32)),
-                        (0, 0) => true,
-                        _ => false,
-                    }
-                } else {
-                    false
+        let wasi_ctx = if with_wasi {
+            let mut wasi = wasmtime_wasi::WasiCtxBuilder::new();
+
+            if std::env::var("EXTISM_ENABLE_WASI_OUTPUT").is_ok() {
+                wasi.inherit_stdout().inherit_stderr();
+            }
+
+            if let Some(p) = &manifest.allowed_paths {
+                for (k, v) in p.iter() {
+                    wasi.preopened_dir(
+                        k,
+                        v.to_string_lossy(),
+                        wasmtime_wasi::DirPerms::READ | wasmtime_wasi::DirPerms::MUTATE,
+                        wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
+                    )?;
                 }
-            })
-            .unwrap_or(false)
-    }
+            }
 
-    // Store input in memory and re-initialize `Internal` pointer
-    pub(crate) fn set_input(
-        &mut self,
-        input: *const u8,
-        mut len: usize,
-        host_context: Option<Rooted<ExternRef>>,
-    ) -> Result<(), Error> {
-        self.output = Output::default();
-        self.clear_error()?;
-        let id = self.id.to_string();
+            Some(wasi.build_p1())
+        } else {
+            None
+        };
 
-        if input.is_null() {
-            len = 0;
-        }
+        let mut store = wasmtime::Store::new(
+            &engine,
+            CallContext {
+                id,
+                stack: Stack::new(),
+                http_response: None,
+                http_response_status: 0,
+                config: manifest.config,
+                vars: HashMap::default(),
+                memory_limiter,
+                wasi_ctx,
+                max_http_response_bytes: manifest.memory.max_http_response_bytes,
+                max_var_bytes: manifest.memory.max_var_bytes,
+            },
+        );
+        let mut linked = HashSet::new();
+        let imports: Vec<_> = imports.into_iter().collect();
 
-        {
-            let store = &mut self.store as *mut _;
-            let linker = &mut self.linker as *mut _;
-            let current_plugin = self.current_plugin_mut();
-            current_plugin.store = store;
-            current_plugin.linker = linker;
-        }
+        let mut linker = wasmtime::Linker::new(&engine);
 
-        let bytes = unsafe { std::slice::from_raw_parts(input, len) };
-        debug!(plugin = &id, "input size: {}", bytes.len());
+        if with_wasi {
+            wasmtime_wasi::preview1::add_to_linker_async(&mut linker, |x: &mut CallContext| {
+                x.wasi_ctx.as_mut().unwrap()
+            })?;
+        };
 
-        self.reset()?;
-        let handle = self.current_plugin_mut().memory_new(bytes)?;
-
-        if let Some(f) = self
-            .linker
-            .get(&mut self.store, EXTISM_ENV_MODULE, "input_set")
-        {
-            f.into_func().unwrap().call(
-                &mut self.store,
-                &[Val::I64(handle.offset() as i64), Val::I64(len as i64)],
-                &mut [],
+        pdk::add_functions(&engine, &mut linker, manifest.allowed_hosts)?;
+        for f in imports.iter() {
+            let ft = wasmtime::FuncType::new(&engine, f.params.clone(), f.results.clone());
+            let f = f.clone();
+            linker.func_new_async(
+                f.module.as_str(),
+                f.name.as_str(),
+                ft,
+                move |caller, params, results| {
+                    let g = unsafe {
+                        &*(f.callback.as_ref() as *const function::FunctionInner
+                            as *const function::FunctionInnerOriginal)
+                    };
+                    g(caller, params, results)
+                },
             )?;
         }
 
-        if let Some(Extern::Global(ctxt)) =
-            self.linker
-                .get(&mut self.store, EXTISM_ENV_MODULE, "extism_context")
-        {
-            ctxt.set(&mut self.store, Val::ExternRef(host_context))?;
-        }
-
-        Ok(())
-    }
-
-    /// Reset Extism runtime, this will invalidate all allocated memory
-    pub fn reset(&mut self) -> Result<(), Error> {
-        let id = self.id.to_string();
-
-        if let Some(f) = self.linker.get(&mut self.store, EXTISM_ENV_MODULE, "reset") {
-            f.into_func().unwrap().call(&mut self.store, &[], &mut [])?;
+        if let Some(main) = modules.get("main").cloned() {
+            link_modules(&mut store, &mut linker, "main", main, &modules, &mut linked).await?;
         } else {
-            error!(plugin = &id, "call to extism:host/env::reset failed");
-        }
-
-        Ok(())
-    }
-
-    /// Determine if wasi is enabled
-    pub fn has_wasi(&self) -> bool {
-        self.current_plugin().wasi.is_some()
-    }
-
-    // Do a best-effort attempt to detect any guest runtime.
-    fn detect_guest_runtime(
-        &mut self,
-        instance_lock: &mut std::sync::MutexGuard<Option<Instance>>,
-    ) {
-        // Check for Haskell runtime initialization functions
-        // Initialize Haskell runtime if `hs_init` is present,
-        // by calling the `hs_init` export
-        if let Some(init) = self.get_func(instance_lock, "hs_init") {
-            let reactor_init = if let Some(init) = self.get_func(instance_lock, "_initialize") {
-                if init.typed::<(), ()>(&self.store()).is_err() {
-                    trace!(
-                        plugin = self.id.to_string(),
-                        "_initialize function found with type {:?}",
-                        init.ty(self.store())
-                    );
-                    None
-                } else {
-                    trace!(plugin = self.id.to_string(), "WASI reactor module detected");
-                    Some(init)
-                }
-            } else {
-                None
-            };
-            self.runtime = Some(GuestRuntime::Haskell { init, reactor_init });
-            return;
-        }
-
-        // Check for `__wasm_call_ctors` or `_initialize`, this is used by WASI to
-        // initialize certain interfaces.
-        let init = if let Some(init) = self.get_func(instance_lock, "__wasm_call_ctors") {
-            if init.typed::<(), ()>(&self.store()).is_err() {
-                trace!(
-                    plugin = self.id.to_string(),
-                    "__wasm_call_ctors function found with type {:?}",
-                    init.ty(self.store())
-                );
-                return;
-            }
-            trace!(plugin = self.id.to_string(), "WASI runtime detected");
-            init
-        } else if let Some(init) = self.get_func(instance_lock, "_initialize") {
-            if init.typed::<(), ()>(&self.store()).is_err() {
-                trace!(
-                    plugin = self.id.to_string(),
-                    "_initialize function found with type {:?}",
-                    init.ty(self.store())
-                );
-                return;
-            }
-            trace!(plugin = self.id.to_string(), "reactor module detected");
-            init
-        } else {
-            return;
+            anyhow::bail!("no main module provided")
         };
 
-        self.runtime = Some(GuestRuntime::Wasi { init });
-
-        trace!(plugin = self.id.to_string(), "no runtime detected");
-    }
-
-    // Initialize the guest runtime
-    pub(crate) fn initialize_guest_runtime(&mut self) -> Result<(), Error> {
-        let mut store = &mut self.store;
-        if let Some(runtime) = &self.runtime {
-            trace!(plugin = self.id.to_string(), "Plugin::initialize_runtime");
-            match runtime {
-                GuestRuntime::Haskell { init, reactor_init } => {
-                    if let Some(reactor_init) = reactor_init {
-                        reactor_init.call(&mut store, &[], &mut [])?;
-                    }
-                    let mut results = vec![Val::I32(0); init.ty(&store).results().len()];
-                    init.call(
-                        &mut store,
-                        &[Val::I32(0), Val::I32(0)],
-                        results.as_mut_slice(),
-                    )?;
-                    debug!(
-                        plugin = self.id.to_string(),
-                        "initialized Haskell language runtime"
-                    );
-                }
-                GuestRuntime::Wasi { init } => {
-                    init.call(&mut store, &[], &mut [])?;
-                    debug!(plugin = self.id.to_string(), "initialied WASI runtime");
-                }
-            }
+        if manifest.memory.max_pages.is_some() {
+            store.limiter_async(|internal| internal.memory_limiter.as_mut().unwrap());
         }
 
-        Ok(())
+        Ok(Plugin {
+            id,
+            store,
+            linker,
+            modules,
+            instance: None,
+            timeout: manifest.timeout_ms.map(Duration::from_millis),
+            cancel: None,
+            debug_options,
+        })
     }
 
-    // Return the position of the output in memory
-    fn output_memory_position(&mut self) -> Result<(u64, u64), Error> {
-        let out = &mut [Val::I64(0)];
-        let out_len = &mut [Val::I64(0)];
-        let mut store = &mut self.store;
-        if let Some(f) = self
-            .linker
-            .get(&mut store, EXTISM_ENV_MODULE, "output_offset")
-        {
-            f.into_func().unwrap().call(&mut store, &[], out)?;
-        } else {
-            anyhow::bail!("unable to set output")
-        }
-        if let Some(f) = self
-            .linker
-            .get(&mut store, EXTISM_ENV_MODULE, "output_length")
-        {
-            f.into_func().unwrap().call(&mut store, &[], out_len)?;
-        } else {
-            anyhow::bail!("unable to set output length")
-        }
-
-        let offs = out[0].unwrap_i64() as u64;
-        let len = out_len[0].unwrap_i64() as u64;
-        Ok((offs, len))
-    }
-
-    // Get the output data after a call has returned
-    fn output<'a, T: FromBytes<'a>>(&'a mut self) -> Result<T, Error> {
-        let offs = self.output.offset;
-        let len = self.output.length;
-        T::from_bytes(
-            self.current_plugin_mut()
-                .memory_bytes(unsafe { MemoryHandle::new(offs, len) })?,
+    pub async fn new<'a>(
+        wasm: impl Into<WasmInput<'a>>,
+        imports: impl IntoIterator<Item = Function>,
+        with_wasi: bool,
+    ) -> Result<Self, Error> {
+        Self::new_ex(
+            wasm,
+            imports,
+            with_wasi,
+            Default::default(),
+            CacheConfig::Default,
         )
+        .await
     }
 
-    // Cache output memory and error information after call is complete
-    fn get_output_after_call(&mut self) -> Result<(), Error> {
-        let (offs, len) = self.output_memory_position()?;
-        self.output.offset = offs;
-        self.output.length = len;
-        debug!(
-            plugin = self.id.to_string(),
-            "output offset={}, length={}", offs, len
-        );
-
-        let (offs, len) = self.current_plugin_mut().get_error_position();
-        self.output.error_offset = offs;
-        self.output.error_length = len;
-        debug!(
-            plugin = self.id.to_string(),
-            "error offset={}, length={}", offs, len
-        );
-        Ok(())
+    pub fn input(&mut self) -> Pipe {
+        self.store.data_mut().stack.current().input()
     }
 
-    // Implements the build of the `call` function, `raw_call` is also used in the SDK
-    // code
-    pub(crate) fn raw_call(
+    pub fn with_input(&mut self, buf: impl AsRef<[u8]>, close: bool) -> Result<&mut Self, Error> {
+        let mut input = self.input();
+        input.write_all(buf.as_ref())?;
+        if close {
+            input.close()
+        }
+        Ok(self)
+    }
+
+    pub fn cancel_handle(&mut self) -> CancelHandle {
+        if let Some((s, _)) = &self.cancel {
+            return s.clone();
+        }
+
+        let (tx, rx) = futures_time::channel::bounded(1);
+        self.cancel = Some((CancelHandle(tx, self.id), rx));
+        self.cancel.as_ref().unwrap().0.clone()
+    }
+
+    pub(crate) async fn raw_call(
         &mut self,
-        lock: &mut std::sync::MutexGuard<Option<Instance>>,
         name: impl AsRef<str>,
-        input: impl AsRef<[u8]>,
-        host_context: Option<Rooted<ExternRef>>,
-    ) -> Result<i32, (Error, i32)> {
-        let name = name.as_ref();
-        let input = input.as_ref();
-
-        if let Err(e) = self.reset_store(lock) {
-            error!(
-                plugin = self.id.to_string(),
-                "call to Plugin::reset_store failed: {e:?}"
+        params: &[Val],
+        results: &mut [Val],
+    ) -> Result<(), Error> {
+        if self.instance.is_none() {
+            self.instance = Some(
+                self.linker
+                    .instantiate_async(&mut self.store, self.modules.get("main").unwrap())
+                    .await?,
             );
         }
 
-        self.instantiate(lock).map_err(|e| (e, -1))?;
+        // Ensure stack has a frame available
+        self.store.data().stack.current();
 
-        self.set_input(input.as_ptr(), input.len(), host_context)
-            .map_err(|x| (x, -1))?;
+        let f = self
+            .instance
+            .as_mut()
+            .unwrap()
+            .get_func(&mut self.store, name.as_ref())
+            .unwrap();
 
-        let func = match self.get_func(lock, name) {
-            Some(x) => x,
-            None => return Err((anyhow::anyhow!("Function not found: {name}"), -1)),
+        let res = if let (Some(t), Some(c)) = (&self.timeout, &mut self.cancel) {
+            // Timeout and cancellation token
+            match f
+                .call_async(&mut self.store, params, results)
+                .timeout(t.clone())
+                .timeout(c.1.next())
+                .await
+            {
+                Ok(Err(_)) => Err(Error::msg("timeout")),
+                Err(_) => Err(Error::msg("cancelled")),
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Ok(Ok(()))) => Ok(()),
+            }
+        } else if let Some(t) = &self.timeout {
+            // Only timeout
+            match f
+                .call_async(&mut self.store, params, results)
+                .timeout(t.clone())
+                .await
+            {
+                Err(_) => Err(Error::msg("timeout")),
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(())) => Ok(()),
+            }
+        } else if let Some(c) = &mut self.cancel {
+            // Only cancellation token
+            match f
+                .call_async(&mut self.store, params, results)
+                .timeout(c.1.next())
+                .await
+            {
+                Err(_) => Err(Error::msg("cancelled")),
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(())) => Ok(()),
+            }
+        } else {
+            // No timeout or cancellation token
+            f.call_async(&mut self.store, params, results).await
         };
 
-        // Check the number of results, reject functions with more than 1 result
-        let n_results = func.ty(self.store()).results().len();
-        if n_results > 1 {
-            return Err((
-                anyhow::anyhow!("Function {name} has {n_results} results, expected 0 or 1"),
-                -1,
-            ));
-        }
-
-        // Start timer
-        self.timer_tx
-            .send(TimerAction::Start {
-                id: self.id,
-                engine: self.store.engine().clone(),
-                duration: self
-                    .current_plugin()
-                    .manifest
-                    .timeout_ms
-                    .map(std::time::Duration::from_millis),
-            })
-            .expect("Timer should start");
-        self.store.epoch_deadline_trap();
-        self.store.set_epoch_deadline(1);
-        self.current_plugin_mut().start_time = std::time::Instant::now();
-
-        // Call the function
-        let mut results = vec![wasmtime::Val::I32(0); n_results];
-        let mut res = func.call(self.store_mut(), &[], results.as_mut_slice());
-
-        // Stop timer
-        self.store
-            .epoch_deadline_callback(|_| Ok(UpdateDeadline::Continue(1)));
-        let _ = self.timer_tx.send(TimerAction::Stop { id: self.id });
-        self.store_needs_reset = name == "_start";
-
-        // Get extism error
-        self.get_output_after_call().map_err(|x| (x, -1))?;
-        let mut rc = 0;
-        if !results.is_empty() {
-            rc = results[0].i32().unwrap_or(-1);
-            debug!(plugin = self.id.to_string(), "got return code: {}", rc);
-        }
-
-        if self.output.error_offset != 0 && self.output.error_length != 0 {
-            let handle = MemoryHandle {
-                offset: self.output.error_offset,
-                length: self.output.error_length,
-            };
-            if let Ok(e) = self.current_plugin_mut().memory_str(handle) {
-                let x = e.to_string();
-                error!(
-                    plugin = self.id.to_string(),
-                    "call to {name} returned with error message: {}", x
-                );
-                if let Err(e) = res {
-                    res = Err(Error::msg(x).context(e));
-                } else {
-                    res = Err(Error::msg(x))
-                }
-            } else {
-                res = Err(Error::msg(format!(
-                    "Call to Extism plugin function {name} encountered an error"
-                )));
-            }
-        }
-
-        match res {
-            Ok(()) => Ok(rc),
+        let res = match res {
+            Ok(()) => Ok(()),
             Err(e) => {
+                tracing::error!(
+                    plugin = self.id.to_string(),
+                    "call to {} encountered an error: {e:?}",
+                    name.as_ref()
+                );
                 if let Some(coredump) = e.downcast_ref::<wasmtime::WasmCoreDump>() {
                     if let Some(file) = self.debug_options.coredump.clone() {
-                        debug!(
+                        tracing::debug!(
                             plugin = self.id.to_string(),
                             "saving coredump to {}",
                             file.display()
                         );
 
                         if let Err(e) =
-                            std::fs::write(file, coredump.serialize(self.store_mut(), "extism"))
+                            std::fs::write(file, coredump.serialize(&mut self.store, "extism"))
                         {
-                            error!(
+                            tracing::error!(
                                 plugin = self.id.to_string(),
-                                "unable to write coredump: {:?}", e
+                                "unable to write coredump: {:?}",
+                                e
                             );
                         }
                     }
                 }
 
                 if let Some(file) = &self.debug_options.memdump.clone() {
-                    trace!(plugin = self.id.to_string(), "memory dump enabled");
-                    if let Some(memory) = self.current_plugin_mut().memory() {
-                        debug!(
+                    tracing::trace!(plugin = self.id.to_string(), "memory dump enabled");
+                    if let Some(memory) =
+                        self.instance.unwrap().get_memory(&mut self.store, "memory")
+                    {
+                        tracing::debug!(
                             plugin = self.id.to_string(),
                             "dumping memory to {}",
                             file.display()
                         );
                         let data = memory.data(&mut self.store);
                         if let Err(e) = std::fs::write(file, data) {
-                            error!(
+                            tracing::error!(
                                 plugin = self.id.to_string(),
-                                "unable to write memory dump: {:?}", e
+                                "unable to write memory dump: {:?}",
+                                e
                             );
                         }
                     } else {
-                        error!(
+                        tracing::error!(
                             plugin = self.id.to_string(),
                             "unable to get extism memory for writing to disk",
                         );
                     }
                 }
 
-                let wasi_exit_code = e.downcast_ref::<wasi_common::I32Exit>().map(|e| e.0);
-                if let Some(exit_code) = wasi_exit_code {
-                    debug!(
-                        plugin = self.id.to_string(),
-                        "WASI exit code: {}", exit_code
-                    );
-                    if exit_code == 0 {
-                        return Ok(0);
-                    }
-
-                    return Err((e.context("WASI exit code"), exit_code));
-                }
-
-                // Handle timeout interrupts
-                if let Some(wasmtime::Trap::Interrupt) = e.downcast_ref::<wasmtime::Trap>() {
-                    debug!(plugin = self.id.to_string(), "call to {name} timed out");
-                    return Err((Error::msg("timeout"), rc));
-                }
-
-                // Handle out-of-memory error from `MemoryLimiter`
-                let cause = e.root_cause().to_string();
-                if cause == "oom" {
-                    debug!(
-                        plugin = self.id.to_string(),
-                        "call to {name} ran out of memory"
-                    );
-                    return Err((Error::msg(cause), rc));
-                }
-
-                error!(
-                    plugin = self.id.to_string(),
-                    "call to {name} encountered an error: {e:?}"
-                );
-                Err((e, rc))
+                Err(e)
             }
-        }
+        };
+
+        // Reset input
+        self.store.data_mut().stack.current().input().reset();
+
+        res
     }
 
-    /// Call a function by name with the given input, the return value is
-    /// the output data returned by the plugin. The return type can be anything that implements
-    /// [FromBytes]. This data will be invalidated next time the plugin is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - A string representing the name of the export function to call
-    /// * `input` - The input argument to the function. Type should implment [ToBytes].
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // call takes a ToBytes and FromBytes type
-    /// // this function takes an &str and returns an &str
-    /// let output = plugin.call::<&str, &str>("greet", "Benjamin")?;
-    /// assert_eq!(output, "Hello, Benjamin!");
-    /// ```
-    pub fn call<'a, 'b, T: ToBytes<'a>, U: FromBytes<'b>>(
-        &'b mut self,
-        name: impl AsRef<str>,
-        input: T,
-    ) -> Result<U, Error> {
-        let lock = self.instance.clone();
-        let mut lock = lock.lock().unwrap();
-        let data = input.to_bytes()?;
-        self.raw_call(&mut lock, name, data, None)
-            .map_err(|e| e.0)
-            .and_then(move |rc| {
-                if rc != 0 {
-                    Err(Error::msg(format!("Returned non-zero exit code: {rc}")))
-                } else {
-                    self.output()
-                }
-            })
-    }
-
-    pub fn call_with_host_context<'a, 'b, T, U, C>(
-        &'b mut self,
-        name: impl AsRef<str>,
-        input: T,
-        host_context: C,
-    ) -> Result<U, Error>
-    where
-        T: ToBytes<'a>,
-        U: FromBytes<'b>,
-        C: Any + Send + Sync + 'static,
-    {
-        let lock = self.instance.clone();
-        let mut lock = lock.lock().unwrap();
-        let data = input.to_bytes()?;
-        let ctx = ExternRef::new(&mut self.store, host_context)?;
-        self.raw_call(&mut lock, name, data, Some(ctx))
-            .map_err(|e| e.0)
-            .and_then(move |_| self.output())
-    }
-
-    /// Similar to `Plugin::call`, but returns the Extism error code along with the
-    /// `Error`. It is assumed if `Ok(_)` is returned that the error code was `0`.
-    ///
-    /// All Extism plugin calls return an error code, `Plugin::call` consumes the error code,
-    /// while `Plugin::call_get_error_code` preserves it - this function should only be used
-    /// when you need to inspect the actual return value of a plugin function when it fails.
-    pub fn call_get_error_code<'a, 'b, T: ToBytes<'a>, U: FromBytes<'b>>(
-        &'b mut self,
-        name: impl AsRef<str>,
-        input: T,
-    ) -> Result<U, (Error, i32)> {
-        let lock = self.instance.clone();
-        let mut lock = lock.lock().unwrap();
-        let data = input.to_bytes().map_err(|e| (e, -1))?;
-        self.raw_call(&mut lock, name, data, None)
-            .and_then(move |_| self.output().map_err(|e| (e, -1)))
-    }
-
-    /// Get a `CancelHandle`, which can be used from another thread to cancel a running plugin
-    pub fn cancel_handle(&self) -> CancelHandle {
-        self.cancel_handle.clone()
-    }
-
-    pub(crate) fn clear_error(&mut self) -> Result<(), Error> {
-        trace!(plugin = self.id.to_string(), "clearing error");
-        let (linker, mut store) = self.linker_and_store();
-        if let Some(f) = linker.get(&mut store, EXTISM_ENV_MODULE, "error_set") {
-            f.into_func()
-                .unwrap()
-                .call(&mut store, &[Val::I64(0)], &mut [])?;
-            Ok(())
-        } else {
-            anyhow::bail!("Plugin::clear_error failed, extism:host/env::error_set not found")
-        }
-    }
-
-    // A convenience method to set the plugin error and return a value
-    pub(crate) fn return_error<E>(
+    pub async fn call_with_args<Output: FromBytesOwned>(
         &mut self,
-        instance_lock: &mut std::sync::MutexGuard<Option<Instance>>,
-        e: impl std::fmt::Display,
-        x: E,
-    ) -> E {
-        if instance_lock.is_none() {
-            error!(
-                plugin = self.id.to_string(),
-                "no instance, unable to set error: {}", e
-            );
-            return x;
-        }
-        match self.current_plugin_mut().set_error(e.to_string()) {
-            Ok((a, b)) => {
-                self.output.error_offset = a;
-                self.output.error_length = b;
-            }
-            Err(e) => {
-                error!(plugin = self.id.to_string(), "unable to set error: {e:?}")
-            }
-        }
-        x
+        name: impl AsRef<str>,
+        params: &[Val],
+        results: &mut [Val],
+    ) -> Result<Output, Error> {
+        self.raw_call(name, params, results).await?;
+        self.output()
     }
-}
 
-// Enumerates the PDK languages that need some additional initialization
-#[derive(Clone)]
-pub(crate) enum GuestRuntime {
-    Haskell {
-        init: Func,
-        reactor_init: Option<Func>,
-    },
-    Wasi {
-        init: Func,
-    },
-}
+    pub async fn call<'a, Input: ToBytes<'a>, Output: FromBytesOwned>(
+        &mut self,
+        name: impl AsRef<str>,
+        input: Input,
+    ) -> Result<Output, Error> {
+        self.with_input(input.to_bytes()?.as_ref(), true)?
+            .call_with_args(name, &[], &mut [])
+            .await
+    }
 
-/// The `typed_plugin` macro is used to create a newtype wrapper around `Plugin` with methods defined for the specified functions.
-///
-/// For example, we can define a new type `MyPlugin` that automatically implements `From`/`Into` for `Plugin`
-/// ```rust
-/// #[derive(serde::Deserialize)]
-/// struct Count {
-///   count: usize,
-/// }
-///
-/// extism::typed_plugin!(MyPlugin {
-///   count_vowels(&str) -> extism::convert::Json<Count>;
-/// });
-///
-/// # const WASM: &[u8] = include_bytes!("../../wasm/code.wasm");
-/// // Convert from `Plugin` to `MyPlugin`
-/// let mut plugin: MyPlugin = extism::Plugin::new(WASM, [], true).unwrap().try_into().unwrap();
-/// // and call the `count_vowels` function
-/// let count = plugin.count_vowels("this is a test").unwrap();
-/// ```
-#[macro_export]
-macro_rules! typed_plugin {
-    ($pub:vis $name:ident {$($f:ident $(< $( $lt:tt $( : $clt:path )? ),+ >)? ($input:ty) -> $output:ty);*$(;)?}) => {
-        $pub struct $name(pub $crate::Plugin);
+    pub(crate) fn take_output(&self) -> Vec<u8> {
+        self.store.data().stack.current().output().take()
+    }
 
-        unsafe impl Send for $name {}
-        unsafe impl Sync for $name {}
-
-        impl TryFrom<$crate::Plugin> for $name {
-            type Error = $crate::Error;
-            fn try_from(mut x: $crate::Plugin) -> Result<Self, Self::Error> {
-                $(
-                    if !x.function_exists(stringify!($f)) {
-                        return Err($crate::Error::msg(format!("Invalid function: {}", stringify!($f))));
-                    }
-                )*
-                Ok($name(x))
-            }
-        }
-
-        impl From<$name> for $crate::Plugin {
-            fn from(x: $name) -> Self {
-                x.0
-            }
-        }
-
-        impl $name {
-            $(
-                pub fn $f<'a, $( $( $lt $( : $clt )? ),+ )? >(&'a mut self, input: $input) -> Result<$output, $crate::Error> {
-                    self.0.call(stringify!($f), input)
-                }
-            )*
-        }
-    };
+    pub(crate) fn output<Output: FromBytesOwned>(&mut self) -> Result<Output, Error> {
+        // Get output a clear the buffer
+        let out = self.take_output();
+        Output::from_bytes_owned(&out)
+    }
 }

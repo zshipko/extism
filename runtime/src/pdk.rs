@@ -1,379 +1,406 @@
-/// All the functions in the file are exposed from inside WASM plugins
+use std::{io::Read, str::FromStr};
+
+use bytes::Buf;
+
 use crate::*;
 
-/// This macro unwraps input arguments to prevent functions from panicking,
-/// it should be used instead of `Val::unwrap_*` functions
-macro_rules! args {
-    ($input:expr, $index:expr, $ty:ident) => {
-        match $input[$index].$ty() {
-            Some(x) => x,
-            None => return Err($crate::Error::msg("Invalid input type"))
-        }
-    };
-    ($input:expr, $(($index:expr, $ty:ident)),*$(,)?) => {
-        ($(
-            $crate::args!($input, $index, $ty),
-        )*)
-    };
+pub(crate) fn handle(handle: u64) -> (u32, u32) {
+    let offs = handle >> 32 & 0xffffffff;
+    let len = handle & 0xffffffff;
+    (offs as u32, len as u32)
 }
 
-/// Get a configuration value
-/// Params: i64 (offset)
-/// Returns: i64 (offset)
-pub(crate) fn config_get(
-    mut caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    output: &mut [Val],
-) -> Result<(), Error> {
-    let data: &mut CurrentPlugin = caller.data_mut();
-
-    let offset = args!(input, 0, i64) as u64;
-    let handle = match data.memory_handle(offset) {
-        Some(h) => h,
-        None => anyhow::bail!("invalid handle offset for config key: {offset}"),
-    };
-    let key = data.memory_str(handle)?;
-    let key = unsafe {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(key.as_ptr(), key.len()))
-    };
-    let val = data.manifest.config.get(key);
-    let ptr = val.map(|x| (x.len(), x.as_ptr()));
-    let mem = match ptr {
-        Some((len, ptr)) => {
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-            data.memory_new(bytes)?
-        }
-        None => {
-            output[0] = Val::I64(0);
-            return Ok(());
-        }
-    };
-    output[0] = Val::I64(mem.offset() as i64);
-    Ok(())
+#[repr(u8)]
+enum Stream {
+    Input = 0,
+    Output = 1,
 }
 
-/// Get a variable
-/// Params: i64 (offset)
-/// Returns: i64 (offset)
-pub(crate) fn var_get(
-    mut caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    output: &mut [Val],
-) -> Result<(), Error> {
-    let data: &mut CurrentPlugin = caller.data_mut();
+impl TryFrom<u8> for Stream {
+    type Error = Error;
 
-    let offset = args!(input, 0, i64) as u64;
-    let handle = match data.memory_handle(offset) {
-        Some(h) => h,
-        None => anyhow::bail!("invalid handle offset for var key: {offset}"),
-    };
-    let key = data.memory_str(handle)?;
-    let key = unsafe {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(key.as_ptr(), key.len()))
-    };
-    let val = data.vars.get(key);
-    let ptr = val.map(|x| (x.len(), x.as_ptr()));
-    let mem = match ptr {
-        Some((len, ptr)) => {
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-            data.memory_new(bytes)?
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Stream::Input),
+            1 => Ok(Stream::Output),
+            _ => anyhow::bail!("invalid pipe: {value}"),
         }
-        None => {
-            output[0] = Val::I64(0);
-            return Ok(());
-        }
-    };
-    output[0] = Val::I64(mem.offset() as i64);
-    Ok(())
+    }
 }
 
-/// Set a variable, if the value offset is 0 then the provided key will be removed
-/// Params: i64 (key offset), i64 (value offset)
-/// Returns: none
-pub(crate) fn var_set(
-    mut caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    _output: &mut [Val],
+pub(crate) fn add_functions(
+    engine: &wasmtime::Engine,
+    linker: &mut wasmtime::Linker<CallContext>,
+    allowed_hosts: Option<Vec<String>>,
 ) -> Result<(), Error> {
-    let data: &mut CurrentPlugin = caller.data_mut();
-
-    if data.manifest.memory.max_var_bytes.is_some_and(|x| x == 0) {
-        anyhow::bail!("Vars are disabled by this host")
-    }
-
-    let voffset = args!(input, 1, i64) as u64;
-    let key_offs = args!(input, 0, i64) as u64;
-
-    let key = {
-        let handle = match data.memory_handle(key_offs) {
-            Some(h) => h,
-            None => anyhow::bail!("invalid handle offset for var key: {key_offs}"),
-        };
-        let key = data.memory_str(handle)?;
-        let key_len = key.len();
-        let key_ptr = key.as_ptr();
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(key_ptr, key_len)) }
-    };
-
-    // Remove if the value offset is 0
-    if voffset == 0 {
-        data.vars.remove(key);
-        return Ok(());
-    }
-
-    let handle = match data.memory_handle(voffset) {
-        Some(h) => h,
-        None => anyhow::bail!("invalid handle offset for var value: {voffset}"),
-    };
-
-    let mut size = std::mem::size_of::<String>()
-        + std::mem::size_of::<Vec<u8>>()
-        + key.len()
-        + handle.length as usize;
-
-    for (k, v) in data.vars.iter() {
-        size += k.len();
-        size += v.len();
-        size += std::mem::size_of::<String>() + std::mem::size_of::<Vec<u8>>();
-    }
-
-    // If the store is larger than the configured size, or 1mb by default, then stop adding things
-    if size > data.manifest.memory.max_var_bytes.unwrap_or(1024 * 1024) as usize && voffset != 0 {
-        return Err(Error::msg("Variable store is full"));
-    }
-
-    let value = data.memory_bytes(handle)?.to_vec();
-
-    // Insert the value from memory into the `vars` map
-    data.vars.insert(key.to_string(), value);
-
-    Ok(())
-}
-
-/// Make an HTTP request
-/// Params: i64 (offset to JSON encoded HttpRequest), i64 (offset to body or 0)
-/// Returns: i64 (offset)
-pub(crate) fn http_request(
-    #[allow(unused_mut)] mut caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    output: &mut [Val],
-) -> Result<(), Error> {
-    let data: &mut CurrentPlugin = caller.data_mut();
-    let http_req_offset = args!(input, 0, i64) as u64;
-    #[cfg(not(feature = "http"))]
-    {
-        let handle = match data.memory_handle(http_req_offset) {
-            Some(h) => h,
-            None => anyhow::bail!("http_request input is invalid: {http_req_offset}"),
-        };
-        let req: extism_manifest::HttpRequest = serde_json::from_slice(data.memory_bytes(handle)?)?;
-        output[0] = Val::I64(0);
-        anyhow::bail!(
-            "http_request is not enabled, request to {} is not allowed",
-            &req.url
-        );
-    }
-
-    #[cfg(feature = "http")]
-    {
-        use std::io::Read;
-        let handle = match data.memory_handle(http_req_offset) {
-            Some(h) => h,
-            None => anyhow::bail!("invalid handle offset for http request: {http_req_offset}"),
-        };
-        let req: extism_manifest::HttpRequest = serde_json::from_slice(data.memory_bytes(handle)?)?;
-
-        let body_offset = args!(input, 1, i64) as u64;
-
-        let url = match url::Url::parse(&req.url) {
-            Ok(u) => u,
-            Err(e) => return Err(Error::msg(format!("Invalid URL: {e:?}"))),
-        };
-        let allowed_hosts = &data.manifest.allowed_hosts;
-        let host_str = url.host_str().unwrap_or_default();
-        let host_matches = if let Some(allowed_hosts) = allowed_hosts {
-            allowed_hosts.iter().any(|url| {
-                let pat = match glob::Pattern::new(url) {
-                    Ok(x) => x,
-                    Err(_) => return url == host_str,
+    let ft = wasmtime::FuncType::new(&engine, [ValType::I32, HANDLE], [ValType::I64]);
+    linker.func_new_async(
+        "extism:host/env",
+        "read",
+        ft,
+        |mut caller, params, results| {
+            Box::new(async move {
+                let pipe = Stream::try_from(params[0].unwrap_i32() as u8)?;
+                let (offs, len) = handle(params[1].unwrap_i64() as u64);
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let ctx: &mut CallContext = caller.data_mut();
+                let pipe = match pipe {
+                    Stream::Input => ctx.stack.current().input(),
+                    Stream::Output => ctx.stack.current().output(),
                 };
-
-                pat.matches(host_str)
+                let data: Vec<u8> = if let Ok(mut r) = pipe.data.write() {
+                    let size = r.len();
+                    if size == 0 {
+                        if pipe.is_closed() {
+                            results[0] = wasmtime::Val::I64(-1);
+                        } else {
+                            results[0] = wasmtime::Val::I64(0);
+                        }
+                        return Ok(());
+                    }
+                    let n = size.min(len as usize);
+                    r.drain(0..n).collect()
+                } else {
+                    anyhow::bail!("unable to read from input stream");
+                };
+                mem.write(&mut caller, offs as usize, &data)?;
+                results[0] = wasmtime::Val::I64(data.len() as i64);
+                Ok(())
             })
-        } else {
-            false
-        };
+        },
+    )?;
 
-        if !host_matches {
-            return Err(Error::msg(format!(
-                "HTTP request to {} is not allowed",
-                req.url
-            )));
-        }
+    let ft = wasmtime::FuncType::new(&engine, [ValType::I32], [ValType::I64]);
+    linker.func_new_async(
+        "extism:host/env",
+        "bytes_remaining",
+        ft,
+        |mut caller, params, results| {
+            Box::new(async move {
+                let pipe = Stream::try_from(params[0].unwrap_i32() as u8)?;
+                let ctx: &mut CallContext = caller.data_mut();
+                let pipe = match pipe {
+                    Stream::Input => ctx.stack.current().input(),
+                    Stream::Output => ctx.stack.current().output(),
+                };
+                results[0] = wasmtime::Val::I64(pipe.data.read().unwrap().len() as i64);
+                Ok(())
+            })
+        },
+    )?;
 
-        let mut r = ureq::request(req.method.as_deref().unwrap_or("GET"), &req.url);
-
-        for (k, v) in req.headers.iter() {
-            r = r.set(k, v);
-        }
-
-        // Set HTTP timeout to respect the manifest timeout
-        if let Some(remaining) = data.time_remaining() {
-            r = r.timeout(remaining);
-        }
-
-        let res = if body_offset > 0 {
-            let handle = match data.memory_handle(body_offset) {
-                Some(h) => h,
-                None => {
-                    anyhow::bail!("invalid handle offset for http request body: {http_req_offset}")
+    let ft = wasmtime::FuncType::new(&engine, [ValType::I32, HANDLE], [ValType::I64]);
+    linker.func_new_async(
+        "extism:host/env",
+        "write",
+        ft,
+        |mut caller, params, results| {
+            Box::new(async move {
+                let pipe = Stream::try_from(params[0].unwrap_i32() as u8)?;
+                let (offs, len) = handle(params[1].unwrap_i64() as u64);
+                let pipe = {
+                    let ctx: &mut CallContext = caller.data_mut();
+                    let pipe = match pipe {
+                        Stream::Input => ctx.stack.current().input(),
+                        Stream::Output => ctx.stack.current().output(),
+                    };
+                    if pipe.is_closed() {
+                        results[0] = Val::I64(-1);
+                        return Ok(());
+                    }
+                    pipe
+                };
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let mut data = vec![0u8; len as usize];
+                mem.read(&mut caller, offs as usize, &mut data)?;
+                if let Ok(mut r) = pipe.data.write() {
+                    r.extend(data);
+                } else {
+                    anyhow::bail!("unable to write to output stream");
                 }
-            };
-            let buf: &[u8] = data.memory_bytes(handle)?;
-            r.send_bytes(buf)
-        } else {
-            r.call()
-        };
+                results[0] = Val::I64(len as i64);
+                Ok(())
+            })
+        },
+    )?;
 
-        let reader = match res {
-            Ok(res) => {
-                data.http_status = res.status();
-                Some(res.into_reader())
-            }
-            Err(e) => {
-                // Catch timeout and return
-                if let Some(d) = data.time_remaining() {
-                    if e.kind() == ureq::ErrorKind::Io && d.as_nanos() == 0 {
-                        anyhow::bail!("timeout");
+    let ft = wasmtime::FuncType::new(&engine, [ValType::I32], []);
+    linker.func_new_async(
+        "extism:host/env",
+        "close",
+        ft,
+        |mut caller, params, _results| {
+            Box::new(async move {
+                let ctx: &mut CallContext = caller.data_mut();
+                let pipe = Stream::try_from(params[0].unwrap_i32() as u8)?;
+                let pipe = match pipe {
+                    Stream::Input => ctx.stack.current().input(),
+                    Stream::Output => ctx.stack.current().output(),
+                };
+                pipe.close();
+                Ok(())
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [], []);
+    linker.func_new_async(
+        "extism:host/env",
+        "stack_push",
+        ft,
+        |caller, _params, _results| {
+            Box::new(async move {
+                caller.data().stack.push();
+                Ok(())
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [], []);
+    linker.func_new_async(
+        "extism:host/env",
+        "stack_pop",
+        ft,
+        |caller, _params, _results| {
+            Box::new(async move {
+                caller.data().stack.pop();
+                Ok(())
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [HANDLE], []);
+    linker.func_new_async(
+        "extism:host/env",
+        "error",
+        ft,
+        |mut caller, params, _results| {
+            Box::new(async move {
+                let (offs, len) = handle(params[0].unwrap_i64() as u64);
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let mut data = vec![0u8; len as usize];
+                mem.read(&mut caller, offs as usize, &mut data)?;
+                let msg = String::from_utf8(data)?;
+                Err(Error::msg(msg))
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [HANDLE], [ValType::I64]);
+    linker.func_new_async(
+        "extism:host/env",
+        "config_length",
+        ft,
+        |mut caller, params, results| {
+            Box::new(async move {
+                let (offs, len) = handle(params[0].unwrap_i64() as u64);
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let mut data = vec![0u8; len as usize];
+                mem.read(&mut caller, offs as usize, &mut data)?;
+                let key = String::from_utf8(data)?;
+                let ctx = caller.data();
+                let len = if let Some(v) = ctx.config.get(&key) {
+                    v.len() as i64
+                } else {
+                    -1
+                };
+                results[0] = Val::I64(len);
+                Ok(())
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [HANDLE, HANDLE], [ValType::I64]);
+    linker.func_new_async(
+        "extism:host/env",
+        "config_read",
+        ft,
+        |mut caller, params, results| {
+            Box::new(async move {
+                let (offs, len) = handle(params[0].unwrap_i64() as u64);
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let mut key = vec![0u8; len as usize];
+                mem.read(&mut caller, offs as usize, &mut key)?;
+                let key = String::from_utf8(key)?;
+                let ctx = caller.data();
+                let v = ctx.config.get(&key);
+                let len = if let Some(v) = v {
+                    let n = v.len().min(len as usize);
+                    unsafe {
+                        mem.data_ptr(&caller)
+                            .add(offs as usize)
+                            .copy_from(v.as_ptr(), v.len())
+                    }
+                    n as i64
+                } else {
+                    -1
+                };
+                results[0] = Val::I64(len);
+                Ok(())
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [ValType::I32, HANDLE], []);
+    linker.func_new_async(
+        "extism:host/env",
+        "log",
+        ft,
+        |mut caller, params, _results| {
+            Box::new(async move {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let level = params[0].unwrap_i32();
+                let (msg_offs, msg_len) = handle(params[1].unwrap_i64() as u64);
+                let msg =
+                    &mem.data(&caller)[msg_offs as usize..msg_offs as usize + msg_len as usize];
+                let msg = std::str::from_utf8(msg)?;
+                let id = caller.data().id.to_string();
+                match level {
+                    0 => {
+                        tracing::error!(plugin = id, "{}", msg)
+                    }
+                    1 => {
+                        tracing::warn!(plugin = id, "{}", msg)
+                    }
+                    2 => {
+                        tracing::info!(plugin = id, "{}", msg)
+                    }
+                    3 => {
+                        tracing::debug!(plugin = id, "{}", msg)
+                    }
+                    4 => {
+                        tracing::trace!(plugin = id, "{}", msg)
+                    }
+                    x => {
+                        anyhow::bail!("Invalid log level: {}", x);
                     }
                 }
-                let msg = e.to_string();
-                if let Some(res) = e.into_response() {
-                    data.http_status = res.status();
-                    Some(res.into_reader())
-                } else {
-                    return Err(Error::msg(msg));
-                }
-            }
-        };
-
-        if let Some(reader) = reader {
-            let mut buf = Vec::new();
-            let max = if let Some(max) = &data.manifest.memory.max_http_response_bytes {
-                reader.take(*max + 1).read_to_end(&mut buf)?;
-                *max
-            } else {
-                reader.take(1024 * 1024 * 50 + 1).read_to_end(&mut buf)?;
-                1024 * 1024 * 50
-            };
-
-            if buf.len() > max as usize {
-                anyhow::bail!("HTTP response exceeds the configured maximum number of bytes: {max}")
-            }
-
-            let mem = data.memory_new(&buf)?;
-            output[0] = Val::I64(mem.offset() as i64);
-        } else {
-            output[0] = Val::I64(0);
-        }
-
-        Ok(())
-    }
-}
-
-/// Get the status code of the last HTTP request
-/// Params: none
-/// Returns: i32 (status code)
-pub(crate) fn http_status_code(
-    mut caller: Caller<CurrentPlugin>,
-    _input: &[Val],
-    output: &mut [Val],
-) -> Result<(), Error> {
-    let data: &mut CurrentPlugin = caller.data_mut();
-    output[0] = Val::I32(data.http_status as i32);
-    Ok(())
-}
-
-pub fn log(
-    level: tracing::Level,
-    mut caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    _output: &mut [Val],
-) -> Result<(), Error> {
-    let data: &mut CurrentPlugin = caller.data_mut();
-    let offset = args!(input, 0, i64) as u64;
-
-    let handle = match data.memory_handle(offset) {
-        Some(h) => h,
-        None => anyhow::bail!("invalid handle offset for log message: {offset}"),
-    };
-
-    let id = data.id.to_string();
-    let buf = data.memory_str(handle);
-
-    match buf {
-        Ok(buf) => match level {
-            tracing::Level::ERROR => {
-                tracing::error!(plugin = id, "{}", buf)
-            }
-            tracing::Level::DEBUG => {
-                tracing::debug!(plugin = id, "{}", buf)
-            }
-            tracing::Level::WARN => {
-                tracing::warn!(plugin = id, "{}", buf)
-            }
-            tracing::Level::INFO => {
-                tracing::info!(plugin = id, "{}", buf)
-            }
-            tracing::Level::TRACE => {
-                tracing::trace!(plugin = id, "{}", buf)
-            }
+                Ok(())
+            })
         },
-        Err(_) => tracing::error!(plugin = id, "unable to log message: {:?}", buf),
-    }
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [HANDLE, HANDLE], [ValType::I64]);
+    linker.func_new_async(
+        "extism:host/env",
+        "http_request",
+        ft,
+        move |mut caller, params, results| {
+            let allowed_hosts = allowed_hosts.clone();
+            Box::new(async move {
+                let (offs, len) = handle(params[0].unwrap_i64() as u64);
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let req =
+                    &mem.data(&caller)[offs as usize..offs as usize + len as usize];
+                let r: extism_manifest::HttpRequest = serde_json::from_slice(&req)?;
+                let url = reqwest::Url::parse(&r.url)?;
+                let host = url.host_str().unwrap_or_default();
+
+                if let Some(h) = allowed_hosts.clone() {
+                    let mut ok = false;
+                    for allowed_host in h {
+                        if glob::Pattern::new(allowed_host.as_str())?.matches(host) {
+                            ok = true;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        anyhow::bail!(
+                            "the host {} is not included in the allowed_hosts field of the manifest",
+                            host
+                        );
+                    }
+                } else {
+                    anyhow::bail!(
+                        "the host {} is not included in the allowed_hosts field of the manifest",
+                        host
+                    );
+                }
+                let mut req = reqwest::Client::new().request(
+                    reqwest::Method::from_str(
+                        &r.method.as_deref().unwrap_or("GET").to_ascii_uppercase(),
+                    )?,
+                    reqwest::Url::parse(&r.url)?,
+                );
+
+                for (k, v) in r.headers {
+                    req = req.header(k, v);
+                }
+
+                let body = params[0].unwrap_i64() as u64;
+                if body != 0 {
+                    let (offs, len) = handle(body);
+                    let mut b = vec![0u8; len as usize];
+                    mem.read(&mut caller, offs as usize, &mut b)?;
+                    req = req.body(b);
+                }
+
+                let res = req.send().await?;
+                let status = res.status();
+                let body = if let Some(max) = caller.data().max_http_response_bytes {
+                    let mut data = vec![];
+                    res.bytes().await?.take(max as usize).reader().read_to_end(&mut data)?;
+                    data
+                    } else {
+                    res.bytes().await?.to_vec()
+                };
+                let ctx = caller.data_mut();
+                let len = body.len() as i64;
+                ctx.http_response = Some(body);
+                ctx.http_response_status = status.as_u16();
+
+                results[0] = Val::I64(len);
+
+                Ok(())
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [HANDLE], [ValType::I64]);
+    linker.func_new_async(
+        "extism:host/env",
+        "http_body",
+        ft,
+        |mut caller, params, results| {
+            Box::new(async move {
+                let (offs, len) = handle(params[0].unwrap_i64() as u64);
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let ctx = caller.data_mut();
+                let mut finished = false;
+                if let Some(h) = &mut ctx.http_response {
+                    if h.len() == 0 {
+                        results[0] = Val::I64(-1);
+                        finished = true;
+                    } else {
+                        let data = h.drain(..len as usize).collect::<Vec<_>>();
+                        mem.write(&mut caller, offs as usize, &data)?;
+                        results[0] = Val::I64(len as i64);
+                    }
+                } else {
+                    results[0] = Val::I64(-1);
+                }
+                if finished {
+                    let ctx = caller.data_mut();
+                    ctx.http_response = None;
+                }
+                Ok(())
+            })
+        },
+    )?;
+
+    let ft = wasmtime::FuncType::new(&engine, [], [ValType::I32]);
+    linker.func_new_async(
+        "extism:host/env",
+        "http_status_code",
+        ft,
+        |caller, _params, results| {
+            Box::new(async move {
+                let status = caller.data().http_response_status;
+                results[0] = Val::I32(status as i32);
+                Ok(())
+            })
+        },
+    )?;
+
     Ok(())
-}
-
-/// Write to logs (warning)
-/// Params: i64 (offset)
-/// Returns: none
-pub(crate) fn log_warn(
-    caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    _output: &mut [Val],
-) -> Result<(), Error> {
-    log(tracing::Level::WARN, caller, input, _output)
-}
-
-/// Write to logs (info)
-/// Params: i64 (offset)
-/// Returns: none
-pub(crate) fn log_info(
-    caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    _output: &mut [Val],
-) -> Result<(), Error> {
-    log(tracing::Level::INFO, caller, input, _output)
-}
-
-/// Write to logs (debug)
-/// Params: i64 (offset)
-/// Returns: none
-pub(crate) fn log_debug(
-    caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    _output: &mut [Val],
-) -> Result<(), Error> {
-    log(tracing::Level::DEBUG, caller, input, _output)
-}
-
-/// Write to logs (error)
-/// Params: i64 (offset)
-/// Returns: none
-pub(crate) fn log_error(
-    caller: Caller<CurrentPlugin>,
-    input: &[Val],
-    _output: &mut [Val],
-) -> Result<(), Error> {
-    log(tracing::Level::ERROR, caller, input, _output)
 }

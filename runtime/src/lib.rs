@@ -1,42 +1,37 @@
-// Makes proc-macros able to resolve `::extism` correctly
-extern crate self as extism;
+pub(crate) use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::Write,
+};
 
-pub(crate) use extism_convert::*;
-pub(crate) use std::collections::BTreeMap;
-use std::str::FromStr;
-pub(crate) use wasmtime::*;
-
-#[doc(inline)]
-pub use extism_convert as convert;
-
-pub use anyhow::Error;
-
-mod current_plugin;
+mod call_context;
 mod function;
-mod internal;
-pub(crate) mod manifest;
-pub(crate) mod pdk;
+mod manifest;
+mod pdk;
+mod pipe;
 mod plugin;
 mod plugin_builder;
-mod readonly_dir;
-mod timer;
 
 /// Extism C API
 pub mod sdk;
 
-pub use current_plugin::CurrentPlugin;
-pub use extism_convert::{FromBytes, FromBytesOwned, ToBytes};
-pub use extism_manifest::{Manifest, Wasm, WasmMetadata};
-pub use function::{Function, UserData, Val, ValType, PTR};
-pub use plugin::{CancelHandle, Plugin, WasmInput, EXTISM_ENV_MODULE, EXTISM_USER_MODULE};
+pub use call_context::CallContext;
+use convert::FromBytesOwned;
+pub use function::{Function, FunctionResult};
+pub use manifest::WasmInput;
+pub use pipe::{Frame, Pipe, Stack};
+pub use plugin::{CancelHandle, CurrentPlugin, Plugin};
 pub use plugin_builder::{DebugOptions, PluginBuilder};
 
-pub(crate) use internal::{Internal, Wasi};
-pub(crate) use timer::{Timer, TimerAction};
-pub(crate) use tracing::{debug, error, trace, warn};
+pub use anyhow::Error;
+pub use extism_convert as convert;
+pub use extism_manifest::{Manifest, Wasm, WasmMetadata};
+pub use wasmtime::{Val, ValType};
 
-#[cfg(test)]
-mod tests;
+pub mod val {
+    pub use wasmtime::{ExternRef, HeapType, RefType};
+}
+
+pub const HANDLE: ValType = ValType::I64;
 
 pub(crate) const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 

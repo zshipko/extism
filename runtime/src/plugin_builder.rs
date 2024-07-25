@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use crate::{plugin::WasmInput, *};
+use wasmtime::ProfilingStrategy;
+
+use crate::*;
 
 #[derive(Clone)]
 pub struct DebugOptions {
@@ -8,6 +10,25 @@ pub struct DebugOptions {
     pub coredump: Option<std::path::PathBuf>,
     pub memdump: Option<std::path::PathBuf>,
     pub debug_info: bool,
+}
+
+pub(crate) enum CacheConfig {
+    Disable,
+    Default,
+    Path(PathBuf),
+}
+
+pub(crate) fn profiling_strategy() -> ProfilingStrategy {
+    match std::env::var("EXTISM_PROFILE").as_deref() {
+        Ok("perf") => ProfilingStrategy::PerfMap,
+        Ok("jitdump") => ProfilingStrategy::JitDump,
+        Ok("vtune") => ProfilingStrategy::VTune,
+        Ok(x) => {
+            tracing::warn!("Invalid value for EXTISM_PROFILE: {x}");
+            ProfilingStrategy::None
+        }
+        Err(_) => ProfilingStrategy::None,
+    }
 }
 
 impl Default for DebugOptions {
@@ -24,7 +45,7 @@ impl Default for DebugOptions {
             None
         };
         DebugOptions {
-            profiling_strategy: plugin::profiling_strategy(),
+            profiling_strategy: profiling_strategy(),
             coredump,
             memdump,
             debug_info,
@@ -38,7 +59,7 @@ pub struct PluginBuilder<'a> {
     wasi: bool,
     functions: Vec<Function>,
     debug_options: DebugOptions,
-    cache_config: Option<Option<PathBuf>>,
+    cache_config: CacheConfig,
 }
 
 impl<'a> PluginBuilder<'a> {
@@ -49,7 +70,7 @@ impl<'a> PluginBuilder<'a> {
             wasi: false,
             functions: vec![],
             debug_options: DebugOptions::default(),
-            cache_config: None,
+            cache_config: CacheConfig::Default,
         }
     }
 
@@ -60,43 +81,35 @@ impl<'a> PluginBuilder<'a> {
     }
 
     /// Add a single host function
-    pub fn with_function<T: 'static, F>(
+    pub fn with_function<F>(
         mut self,
+        module: impl Into<String>,
         name: impl Into<String>,
         args: impl IntoIterator<Item = ValType>,
         returns: impl IntoIterator<Item = ValType>,
-        user_data: UserData<T>,
         f: F,
     ) -> Self
     where
-        F: 'static
-            + Fn(&mut CurrentPlugin, &[Val], &mut [Val], UserData<T>) -> Result<(), Error>
-            + Sync
-            + Send,
+        F: 'static + Fn(CurrentPlugin, &[Val], &mut [Val]) -> FunctionResult + Sync + Send,
     {
         self.functions
-            .push(Function::new(name, args, returns, user_data, f));
+            .push(Function::new(module, name, args, returns, f));
         self
     }
 
-    /// Add a single host function in a specific namespace
-    pub fn with_function_in_namespace<T: 'static, F>(
+    pub fn with_function_sync<F>(
         mut self,
-        namespace: impl Into<String>,
+        module: impl Into<String>,
         name: impl Into<String>,
         args: impl IntoIterator<Item = ValType>,
         returns: impl IntoIterator<Item = ValType>,
-        user_data: UserData<T>,
         f: F,
     ) -> Self
     where
-        F: 'static
-            + Fn(&mut CurrentPlugin, &[Val], &mut [Val], UserData<T>) -> Result<(), Error>
-            + Sync
-            + Send,
+        F: 'static + Fn(CurrentPlugin, &[Val], &mut [Val]) -> Result<(), Error> + Sync + Send,
     {
         self.functions
-            .push(Function::new(name, args, returns, user_data, f).with_namespace(namespace));
+            .push(Function::new_sync(module, name, args, returns, f));
         self
     }
 
@@ -138,24 +151,25 @@ impl<'a> PluginBuilder<'a> {
 
     /// Set wasmtime compilation cache config path
     pub fn with_cache_config(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.cache_config = Some(Some(dir.into()));
+        self.cache_config = CacheConfig::Path(dir.into());
         self
     }
 
     /// Turn wasmtime compilation caching off
     pub fn with_cache_disabled(mut self) -> Self {
-        self.cache_config = Some(None);
+        self.cache_config = CacheConfig::Disable;
         self
     }
 
     /// Generate a new plugin with the configured settings
-    pub fn build(self) -> Result<Plugin, Error> {
-        Plugin::build_new(
+    pub async fn build(self) -> Result<Plugin, Error> {
+        Plugin::new_ex(
             self.source,
             self.functions,
             self.wasi,
             self.debug_options,
             self.cache_config,
         )
+        .await
     }
 }

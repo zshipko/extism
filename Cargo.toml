@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["extism-maturin", "manifest", "runtime", "libextism", "convert", "convert-macros"]
-exclude = ["kernel"]
 
 [workspace.package]
 edition = "2021"

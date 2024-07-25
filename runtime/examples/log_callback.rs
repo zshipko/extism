@@ -6,18 +6,21 @@ fn handle_logs(msg: &str) {
     LOGS.lock().unwrap().push(msg.to_string())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     set_log_callback(handle_logs, "extism=trace").unwrap();
     let url = Wasm::file("../wasm/code.wasm");
     let manifest = Manifest::new([url]);
     let mut plugin = PluginBuilder::new(manifest)
         .with_wasi(true)
         .build()
+        .await
         .unwrap();
 
     for _ in 0..5 {
         let res = plugin
-            .call::<&str, &str>("count_vowels", "Hello, world!")
+            .call::<&str, String>("count_vowels", "Hello, world!")
+            .await
             .unwrap();
         tracing::info!("{}", res);
     }
