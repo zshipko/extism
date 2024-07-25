@@ -4,6 +4,7 @@ pub(crate) use std::{
 };
 
 mod call_context;
+mod current_plugin;
 mod function;
 mod manifest;
 mod pdk;
@@ -16,10 +17,11 @@ pub mod sdk;
 
 pub use call_context::CallContext;
 use convert::FromBytesOwned;
+pub use current_plugin::CurrentPlugin;
 pub use function::{Function, FunctionResult};
 pub use manifest::WasmInput;
 pub use pipe::{Frame, Pipe, Stack};
-pub use plugin::{CallBuilder, CancelHandle, CurrentPlugin, Plugin};
+pub use plugin::{CallBuilder, CancelHandle, Plugin};
 pub use plugin_builder::{DebugOptions, PluginBuilder};
 
 pub use anyhow::Error;

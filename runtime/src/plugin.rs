@@ -8,50 +8,6 @@ use futures_time::{prelude::*, time::Duration};
 
 use self::plugin_builder::CacheConfig;
 
-#[repr(transparent)]
-pub struct CurrentPlugin<'a>(pub(crate) wasmtime::Caller<'a, CallContext>);
-
-impl<'a> CurrentPlugin<'a> {
-    pub fn input(&self) -> Pipe {
-        self.0.data().stack.current().input()
-    }
-
-    pub fn output(&self) -> Pipe {
-        self.0.data().stack.current().output()
-    }
-
-    pub fn input_bytes(&self) -> Vec<u8> {
-        self.0.data().stack.current().input().take()
-    }
-
-    pub fn output_bytes(&self, data: impl AsRef<[u8]>) -> Result<(), Error> {
-        self.0
-            .data()
-            .stack
-            .current()
-            .output()
-            .write_all(data.as_ref())?;
-        Ok(())
-    }
-
-    pub fn handle_data(&mut self, h: u64) -> Result<&mut [u8], Error> {
-        let (offs, len) = pdk::handle(h);
-        let offs = offs as usize;
-        let len = len as usize;
-        let data = self
-            .0
-            .get_export("memory")
-            .unwrap()
-            .into_memory()
-            .unwrap()
-            .data_mut(&mut self.0);
-        if offs > data.len() || offs + len > data.len() {
-            anyhow::bail!("Invalid memory handle: offs={}, len={}", offs, len);
-        }
-        Ok(&mut data[offs..offs + len])
-    }
-}
-
 pub struct Plugin {
     pub(crate) id: uuid::Uuid,
     pub(crate) store: wasmtime::Store<CallContext>,
@@ -64,7 +20,7 @@ pub struct Plugin {
     pub(crate) instantiations: usize,
     pub(crate) require_new_instance: bool,
     pub(crate) runtime: Option<GuestRuntime>,
-    pub(crate) allowed_paths: Option<BTreeMap<PathBuf, PathBuf>>,
+    pub(crate) allowed_paths: Option<BTreeMap<String, PathBuf>>,
     pub(crate) allowed_hosts: Option<Vec<String>>,
     pub(crate) functions: Vec<Function>,
 }
@@ -134,7 +90,7 @@ async fn relink(
     max_http_response_bytes: Option<u64>,
     max_var_bytes: Option<u64>,
     with_wasi: bool,
-    allowed_paths: &Option<BTreeMap<PathBuf, PathBuf>>,
+    allowed_paths: &Option<BTreeMap<String, PathBuf>>,
     allowed_hosts: &Option<Vec<String>>,
     config: BTreeMap<String, String>,
     modules: &HashMap<String, wasmtime::Module>,
@@ -159,12 +115,22 @@ async fn relink(
 
         if let Some(p) = allowed_paths {
             for (k, v) in p.iter() {
-                wasi.preopened_dir(
-                    k,
-                    v.to_string_lossy(),
-                    wasmtime_wasi::DirPerms::READ | wasmtime_wasi::DirPerms::MUTATE,
-                    wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
-                )?;
+                if k.starts_with("ro:") {
+                    let k = &k[3..];
+                    wasi.preopened_dir(
+                        k,
+                        v.to_string_lossy(),
+                        wasmtime_wasi::DirPerms::READ,
+                        wasmtime_wasi::FilePerms::READ,
+                    )?;
+                } else {
+                    wasi.preopened_dir(
+                        k,
+                        v.to_string_lossy(),
+                        wasmtime_wasi::DirPerms::READ | wasmtime_wasi::DirPerms::MUTATE,
+                        wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
+                    )?;
+                };
             }
         }
 
@@ -238,7 +204,7 @@ impl Plugin {
         imports: impl IntoIterator<Item = Function>,
         with_wasi: bool,
         debug_options: DebugOptions,
-        cache_config: CacheConfig,
+        cache_config: crate::plugin_builder::CacheConfig,
     ) -> Result<Self, Error> {
         let id = uuid::Uuid::new_v4();
         let mut config = wasmtime::Config::new();
