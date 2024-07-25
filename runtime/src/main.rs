@@ -16,17 +16,12 @@ pub async fn main() -> Result<(), Error> {
         },
     );
     let mut plugin = Plugin::new(Manifest::new([Wasm::file(&args[0])]), [f], true).await?;
-    let results = &mut [];
 
     for _ in 0..std::env::var("LOOP")
         .map(|x| x.parse().unwrap_or(1))
         .unwrap_or(1)
     {
-        let s: String = plugin
-            .with_input(&args[2], true)?
-            .call(&args[1], &[], results)
-            .await?;
-        println!("{:?}", results);
+        let s: String = plugin.call(&args[1], &args[2]).await?;
         println!("{}", s);
     }
     Ok(())
