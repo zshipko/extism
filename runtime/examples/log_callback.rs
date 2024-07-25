@@ -8,7 +8,7 @@ fn handle_logs(msg: &str) {
 
 #[tokio::main]
 async fn main() {
-    set_log_callback(handle_logs, "extism=trace").unwrap();
+    set_log_callback(handle_logs, "extism=trace,log_callback=trace").unwrap();
     let url = Wasm::file("../wasm/code.wasm");
     let manifest = Manifest::new([url]);
     let mut plugin = PluginBuilder::new(manifest)
@@ -18,11 +18,13 @@ async fn main() {
         .unwrap();
 
     for _ in 0..5 {
-        let res = plugin
-            .call::<&str, String>("count_vowels", "Hello, world!")
+        let res: String = CallBuilder::new(&mut plugin)
+            .input("Hello, world!")
+            .unwrap()
+            .call("count_vowels")
             .await
             .unwrap();
-        tracing::info!("{}", res);
+        tracing::debug!("{}", res);
     }
 
     println!("Dumping logs");

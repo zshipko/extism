@@ -123,13 +123,13 @@ impl Plugin {
         let id = uuid::Uuid::new_v4();
         let mut config = wasmtime::Config::new();
         config
-            .epoch_interruption(true)
             .debug_info(debug_options.debug_info)
             .coredump_on_trap(debug_options.coredump.is_some())
             .profiler(debug_options.profiling_strategy)
             .wasm_tail_call(true)
             .wasm_function_references(true)
-            .wasm_gc(true);
+            .wasm_gc(true)
+            .async_support(true);
 
         match cache_config {
             CacheConfig::Disable => (),
@@ -442,5 +442,125 @@ impl Plugin {
         // Get output a clear the buffer
         let out = self.take_output();
         Output::from_bytes_owned(&out)
+    }
+}
+
+pub struct CallBuilder<'a> {
+    plugin: &'a mut Plugin,
+    params: Vec<Val>,
+    results: Vec<Val>,
+}
+
+pub trait IntoVal {
+    fn into_val(self, store: &mut wasmtime::Store<CallContext>) -> Val;
+}
+
+impl IntoVal for i32 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::I32(self)
+    }
+}
+
+impl IntoVal for i64 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::I64(self)
+    }
+}
+
+impl IntoVal for u32 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::I32(self as i32)
+    }
+}
+
+impl IntoVal for u64 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::I64(self as i64)
+    }
+}
+
+impl IntoVal for i128 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::V128((self as u128).into())
+    }
+}
+
+impl IntoVal for u128 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::V128(self.into())
+    }
+}
+
+impl IntoVal for f32 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::F32(self as u32)
+    }
+}
+
+impl IntoVal for f64 {
+    fn into_val(self, _store: &mut wasmtime::Store<CallContext>) -> Val {
+        Val::F64(self as u64)
+    }
+}
+
+impl<T: Send + Sync + 'static> IntoVal for std::sync::Arc<T> {
+    fn into_val(self, mut store: &mut wasmtime::Store<CallContext>) -> Val {
+        let x = wasmtime::ExternRef::new(&mut store, self).unwrap();
+        Val::ExternRef(Some(x))
+    }
+}
+
+impl<T: Send + Sync + 'static> IntoVal for std::sync::Mutex<T> {
+    fn into_val(self, mut store: &mut wasmtime::Store<CallContext>) -> Val {
+        let x = wasmtime::ExternRef::new(&mut store, self).unwrap();
+        Val::ExternRef(Some(x))
+    }
+}
+
+impl<T: Send + Sync + 'static> IntoVal for std::sync::RwLock<T> {
+    fn into_val(self, mut store: &mut wasmtime::Store<CallContext>) -> Val {
+        let x = wasmtime::ExternRef::new(&mut store, self).unwrap();
+        Val::ExternRef(Some(x))
+    }
+}
+
+impl<'a> CallBuilder<'a> {
+    pub fn new(plugin: &'a mut Plugin) -> Self {
+        CallBuilder {
+            plugin,
+            params: vec![],
+            results: vec![],
+        }
+    }
+
+    pub fn result(mut self, x: ValType) -> Self {
+        let v = match x {
+            ValType::I32 => Val::I32(0),
+            ValType::I64 => Val::I64(0),
+            ValType::F32 => Val::F32(0),
+            ValType::F64 => Val::F64(0),
+            ValType::V128 => Val::V128(wasmtime::V128::from(0)),
+            ValType::Ref(_) => Val::ExternRef(None),
+            // TODO: handle other ref types
+        };
+
+        self.results.push(v);
+        self
+    }
+
+    pub fn param(mut self, x: impl IntoVal) -> Self {
+        self.params.push(x.into_val(&mut self.plugin.store));
+        self
+    }
+
+    pub fn input<'b, T: ToBytes<'b>>(self, x: T) -> Result<Self, Error> {
+        self.plugin.with_input(x.to_bytes()?, true)?;
+        Ok(self)
+    }
+
+    pub async fn call<T: FromBytesOwned>(mut self, name: impl AsRef<str>) -> Result<T, Error> {
+        self.plugin
+            .call_with_args(name, &self.params, &mut self.results)
+            .await
     }
 }

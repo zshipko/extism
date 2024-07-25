@@ -19,7 +19,7 @@ use convert::FromBytesOwned;
 pub use function::{Function, FunctionResult};
 pub use manifest::WasmInput;
 pub use pipe::{Frame, Pipe, Stack};
-pub use plugin::{CancelHandle, CurrentPlugin, Plugin};
+pub use plugin::{CallBuilder, CancelHandle, CurrentPlugin, Plugin};
 pub use plugin_builder::{DebugOptions, PluginBuilder};
 
 pub use anyhow::Error;
