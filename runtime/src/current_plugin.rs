@@ -43,7 +43,7 @@ impl<'a> CurrentPlugin<'a> {
         Ok(&mut data[offs..offs + len])
     }
 
-    pub fn val_handle_data(&mut self, h: Val) -> Result<&mut [u8], Error> {
+    pub fn val_handle_data(&mut self, h: &Val) -> Result<&mut [u8], Error> {
         let h = match h.i64() {
             Some(x) => x as u64,
             None => anyhow::bail!("Invalid handle val: {:?}", h),
@@ -62,5 +62,30 @@ impl<'a> CurrentPlugin<'a> {
             anyhow::bail!("Invalid memory handle: offs={}, len={}", offs, len);
         }
         Ok(&mut data[offs..offs + len])
+    }
+
+    pub fn val_handle<T: FromBytesOwned>(&mut self, h: &Val) -> Result<T, Error> {
+        let h = match h.i64() {
+            Some(x) => x as u64,
+            None => anyhow::bail!("Invalid handle val: {:?}", h),
+        };
+        self.handle(h)
+    }
+
+    pub fn handle<T: FromBytesOwned>(&mut self, h: u64) -> Result<T, Error> {
+        let (offs, len) = pdk::handle(h);
+        let offs = offs as usize;
+        let len = len as usize;
+        let data = self
+            .0
+            .get_export("memory")
+            .unwrap()
+            .into_memory()
+            .unwrap()
+            .data_mut(&mut self.0);
+        if offs > data.len() || offs + len > data.len() {
+            anyhow::bail!("Invalid memory handle: offs={}, len={}", offs, len);
+        }
+        T::from_bytes_owned(&mut data[offs..offs + len])
     }
 }

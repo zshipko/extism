@@ -14,8 +14,13 @@ const WASM_NO_FUNCTIONS: &[u8] = include_bytes!("../../../wasm/code.wasm");
 // host_fn!(pub hello_world (a: String) -> String { Ok(a) });
 
 // Which is the same as:
-fn hello_world(plugin: CurrentPlugin, _inputs: &[Val], _outputs: &mut [Val]) -> Result<(), Error> {
-    plugin.output_bytes("Hello, world!")
+fn hello_world(
+    mut plugin: CurrentPlugin,
+    inputs: &[Val],
+    _outputs: &mut [Val],
+) -> Result<(), Error> {
+    let bytes: Vec<u8> = plugin.val_handle(&inputs[0])?;
+    plugin.output_bytes(&bytes)
 }
 
 fn hello_world_panic(
