@@ -153,6 +153,7 @@ async fn relink(
             wasi_ctx,
             max_http_response_bytes,
             max_var_bytes,
+            main_memory: None,
         },
     );
     let mut linked = HashSet::new();
@@ -346,6 +347,16 @@ impl Plugin {
                 self.linker
                     .instantiate_async(&mut self.store, self.modules.get("main").unwrap())
                     .await?,
+            );
+            self.store.data_mut().main_memory = Some(
+                self.instance
+                    .as_ref()
+                    .unwrap()
+                    .get_export(&mut self.store, "memory")
+                    .unwrap()
+                    .into_memory()
+                    .unwrap()
+                    .clone(),
             );
 
             self.detect_guest_runtime();

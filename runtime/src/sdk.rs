@@ -97,31 +97,31 @@ pub type ExtismLogDrainFunctionType = extern "C" fn(data: *const std::ffi::c_cha
 impl ExtismVal {
     fn from_val(value: &wasmtime::Val, mut ctx: impl wasmtime::AsContextMut) -> Self {
         match value.ty(&ctx) {
-            wasmtime::ValType::I32 => ExtismVal {
+            Ok(wasmtime::ValType::I32) => ExtismVal {
                 t: ExtismValType::I32,
                 v: ExtismValUnion {
                     i32: value.unwrap_i32(),
                 },
             },
-            wasmtime::ValType::I64 => ExtismVal {
+            Ok(wasmtime::ValType::I64) => ExtismVal {
                 t: ExtismValType::I64,
                 v: ExtismValUnion {
                     i64: value.unwrap_i64(),
                 },
             },
-            wasmtime::ValType::F32 => ExtismVal {
+            Ok(wasmtime::ValType::F32) => ExtismVal {
                 t: ExtismValType::F32,
                 v: ExtismValUnion {
                     f32: value.unwrap_f32(),
                 },
             },
-            wasmtime::ValType::F64 => ExtismVal {
+            Ok(wasmtime::ValType::F64) => ExtismVal {
                 t: ExtismValType::F64,
                 v: ExtismValUnion {
                     f64: value.unwrap_f64(),
                 },
             },
-            t if t.matches(&wasmtime::ValType::EXTERNREF) => ExtismVal {
+            Ok(t) if t.matches(&wasmtime::ValType::EXTERNREF) => ExtismVal {
                 t: ExtismValType::ExternRef,
                 v: ExtismValUnion {
                     externref: unsafe {
@@ -129,7 +129,7 @@ impl ExtismVal {
                     },
                 },
             },
-            t => todo!("{}", t),
+            t => todo!("{:?}", t),
         }
     }
 }

@@ -11,6 +11,7 @@ pub struct CallContext {
     pub wasi_ctx: Option<wasmtime_wasi::preview1::WasiP1Ctx>,
     pub max_http_response_bytes: Option<u64>,
     pub max_var_bytes: Option<u64>,
+    pub main_memory: Option<wasmtime::Memory>,
 }
 
 pub(crate) struct MemoryLimiter {
